@@ -1,6 +1,6 @@
 # A2A Transport & RPC Methods
 
-> **Who this is for**: Engineers implementing the A2A (Agent2Agent) protocol directly — building a server, writing a client, or wanting to know exactly what an A2A SDK does on the wire. Targets spec **v1.0.0**.
+> **Who this is for**: Engineers implementing the A2A (Agent2Agent) protocol directly — building a server, writing a client, or wanting to know exactly what an A2A SDK does on the wire. Targets protocol **1.0**, checked against specification release **1.0.1**.
 
 Before reading this, understand how an agent advertises itself: **[The Agent Card](01_agent_card.md)**.
 
@@ -65,7 +65,7 @@ The rest of this note focuses on the **JSON-RPC 2.0 binding**, since it is the d
 
 ## 2. The RPC method set
 
-In the JSON-RPC binding, every operation is invoked by a `method` string. These are the v1.0.0 methods:
+In the JSON-RPC binding, every operation is invoked by a `method` string. These are the protocol 1.0 methods:
 
 | Method | Purpose | Returns |
 |---|---|---|
@@ -83,7 +83,7 @@ In the JSON-RPC binding, every operation is invoked by a `method` string. These 
 
 > **Key insight**: `SendMessage` and `SendStreamingMessage` are the *only* JSON-RPC methods that create or continue work. `GetTask`, `ListTasks`, `CancelTask`, and `SubscribeToTask` operate on tasks that already exist. The push-notification config methods are a small CRUD surface for webhooks — covered in **[Streaming & Push](04_streaming_and_push.md)**.
 
-In gRPC these become RPCs like `SendMessage` / `GetTask`; in HTTP+JSON they become `POST /v1/message:send`, `GET /v1/tasks/{id}`, etc. The names differ, the behavior does not.
+In gRPC these become RPCs like `SendMessage` / `GetTask`; in HTTP+JSON they become `POST /message:send`, `GET /tasks/{id}`, `POST /tasks/{id}:cancel`, and the other resource paths defined by the binding. The removed `/v1/...` prefix belongs to pre-release material and returns `404` on a conforming v1 route map.
 
 ---
 
@@ -152,7 +152,7 @@ A `SendMessage` call carries a `SendMessageRequest` object. The `message` field 
 Notes on the shape:
 
 - The JSON-RPC `id` is echoed back so the client can correlate the response. It is unrelated to the `task.id`.
-- The agent assigns `task.id` and `task.contextId` — the client does **not** supply them on the first call. To continue an existing task, the client passes `taskId` and reuses `contextId` inside the next `Message`.
+- The agent assigns `task.id`. A client may provide `contextId` on the first call; a server that accepts it preserves it, while a server that cannot accept it must reject the request rather than silently replace it. The conservative default is to omit it unless the client understands the server's context policy.
 - `configuration.returnImmediately: false` is the default blocking behavior: the operation waits until the task reaches a terminal or interrupted state. With `returnImmediately: true`, the agent returns the initial task quickly and the client polls with `GetTask`, subscribes with `SubscribeToTask`, or receives push updates. See **[Part 3: Task Lifecycle](03_task_lifecycle.md)**.
 - ⚠️ A `SendMessageResponse` contains **exactly one** of `task` or `message`. Clients MUST branch on which oneof field is present; there is no `kind` discriminator in v1.0.
 
@@ -168,6 +168,7 @@ Host: recipes.example.com
 Content-Type: application/json
 Accept: application/json
 Authorization: Bearer <token>
+A2A-Version: 1.0
 
 { "jsonrpc": "2.0", "id": "req-7f3a1c", "method": "SendMessage", "params": { ... } }
 ```
@@ -175,6 +176,7 @@ Authorization: Bearer <token>
 - **Method & URL**: always `POST` to the agent's `url` from the Agent Card. There is one endpoint; the JSON-RPC `method` field selects the operation — not the path.
 - **`Content-Type`**: requests and non-streaming responses use `application/json`. `SendStreamingMessage` and `SubscribeToTask` responses use `text/event-stream` (SSE).
 - **Auth**: transport-level — typically an `Authorization` header. A2A does not put credentials in the JSON-RPC body.
+- **Protocol version**: every protocol 1.0 request carries `A2A-Version: 1.0` (or the equivalent service parameter for the binding). An empty header is interpreted as `0.3`; unsupported values map to `VersionNotSupportedError`.
 
 > **Rule**: For the JSON-RPC binding, a successful call returns **HTTP 200** even when the *application* outcome is an error. JSON-RPC errors live in the response body, not the status line.
 
@@ -232,8 +234,11 @@ A JSON-RPC error response replaces `result` with an `error` object:
 | `-32004` | `UnsupportedOperationError` | The requested operation is valid but not implemented by this agent (e.g. `SendStreamingMessage` on a non-streaming agent) |
 | `-32005` | `ContentTypeNotSupportedError` | A `Part`'s media type is not accepted by the agent |
 | `-32006` | `InvalidAgentResponseError` | The agent produced a response that violates the A2A spec (surfaced by clients / intermediaries) |
+| `-32007` | `ExtendedAgentCardNotConfiguredError` | `GetExtendedAgentCard` was called after support was declared but no extended card is configured |
+| `-32008` | `ExtensionSupportRequiredError` | A required extension was not activated by the client |
+| `-32009` | `VersionNotSupportedError` | The requested `A2A-Version` is not supported by the selected interface |
 
-In v1.0.0 the JSON-RPC and HTTP+JSON bindings additionally embed a `google.rpc.ErrorInfo` object inside `error.data` — with `reason` (the UPPER_SNAKE_CASE error name, e.g. `TASK_NOT_FOUND`) and `domain: "a2a-protocol.org"` — so machine error-matching does not depend on the numeric code alone:
+`error.data` is optional typed detail. Where applicable, a server can include a `google.rpc.ErrorInfo` object with `reason`, `domain`, and metadata:
 
 ```json
 {
@@ -250,9 +255,9 @@ In v1.0.0 the JSON-RPC and HTTP+JSON bindings additionally embed a `google.rpc.E
 }
 ```
 
-💡 When implementing a server: map your internal exceptions to these codes consistently, and **always populate `error.data`** with enough context (`taskId`, `state`, accepted content types) for the client to act without a second round trip.
+💡 When implementing a server, map internal failures to binding-native codes consistently. Add typed detail when it helps the client act, but do not expose secrets or internal exception strings.
 
-> **Key insight**: Numeric codes are stable across A2A versions, but the `ErrorInfo.reason` string is the canonical identity in v1.0.0. Match on `reason` + `domain` for forward compatibility; treat the numeric `code` as a coarse category.
+Clients branch first on the binding's native error code or type. Only inspect `reason` and `domain` when a typed `ErrorInfo` detail is actually present; do not make optional detail the sole error identity.
 
 ---
 

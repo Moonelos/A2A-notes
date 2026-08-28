@@ -2,7 +2,7 @@
 
 > Building real A2A servers and clients with the official `a2a-sdk` package.
 
-[![a2a-sdk](https://img.shields.io/badge/a2a--sdk-1.0.3-3776AB.svg?logo=python&logoColor=white)](https://pypi.org/project/a2a-sdk/)
+[![a2a-sdk](https://img.shields.io/badge/a2a--sdk-1.1.2-3776AB.svg?logo=python&logoColor=white)](https://pypi.org/project/a2a-sdk/)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-supported-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 

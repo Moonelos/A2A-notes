@@ -1,6 +1,8 @@
 # Building an A2A Server with the Python SDK
 
-> **Who this is for**: Python engineers who have completed [SDK Setup](01_sdk_setup.md) and want to expose an agent over the A2A protocol. You should understand the [Task Lifecycle](../02_protocol/03_task_lifecycle.md) — this file shows how the executor *drives* that lifecycle. Targets `a2a-sdk` **v1.0.3** (May 2026).
+<!-- length-justification: This implementation note keeps the runnable baseline and the same server's executor, streaming, shutdown, and failure paths together so readers can trace one lifecycle end to end. -->
+
+> **Who this is for**: Python engineers who have completed [SDK Setup](01_sdk_setup.md) and want to expose an agent over the A2A protocol. You should understand the [Task Lifecycle](../02_protocol/03_task_lifecycle.md) — this file shows how the executor *drives* that lifecycle. Targets `a2a-sdk` **1.1.2**.
 
 ---
 
@@ -25,6 +27,91 @@ An A2A server is not a framework you subclass — it is four objects you wire to
 ```
 
 > **Rule**: You implement exactly one thing — the `AgentExecutor`. Everything else is SDK plumbing you assemble.
+
+### Run the four pieces as one server
+
+This baseline accepts one text Message and returns a completed Task with an echo Artifact. Save it as `echo_server.py` after installing `a2a-sdk[http-server]==1.1.2` and `uvicorn`:
+
+```python
+from contextlib import asynccontextmanager
+
+import uvicorn
+from starlette.applications import Starlette
+
+from a2a.helpers import new_task_from_user_message, new_text_part
+from a2a.server.agent_execution import AgentExecutor
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
+from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
+from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill
+
+
+class EchoExecutor(AgentExecutor):
+    async def execute(self, context, event_queue) -> None:
+        task = context.current_task or new_task_from_user_message(context.message)
+        await event_queue.enqueue_event(task)
+        updater = TaskUpdater(event_queue, task.id, task.context_id)
+        await updater.start_work()
+        await updater.add_artifact(
+            [new_text_part(f"echo: {context.get_user_input()}")], name="echo"
+        )
+        await updater.complete()
+
+    async def cancel(self, context, event_queue) -> None:
+        task = context.current_task
+        updater = TaskUpdater(event_queue, task.id, task.context_id)
+        await updater.cancel()
+
+
+card = AgentCard(
+    name="Echo Agent",
+    description="Returns the text it receives.",
+    version="0.1.0",
+    supported_interfaces=[AgentInterface(
+        url="http://127.0.0.1:9999",
+        protocol_binding="JSONRPC",
+        protocol_version="1.0",
+    )],
+    capabilities=AgentCapabilities(),
+    default_input_modes=["text/plain"],
+    default_output_modes=["text/plain"],
+    skills=[AgentSkill(
+        id="echo", name="Echo", description="Echo text.", tags=["demo"]
+    )],
+)
+handler = DefaultRequestHandler(
+    agent_executor=EchoExecutor(),
+    task_store=InMemoryTaskStore(),
+    agent_card=card,
+)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    await handler.aclose()  # drain ActiveTask background work before shutdown
+
+
+routes = [*create_agent_card_routes(card), *create_jsonrpc_routes(handler, rpc_url="/")]
+app = Starlette(routes=routes, lifespan=lifespan)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=9999)
+```
+
+Run it and send one request from another shell:
+
+```bash
+python echo_server.py
+curl -s http://127.0.0.1:9999/ \
+  -H 'Content-Type: application/json' \
+  -H 'A2A-Version: 1.0' \
+  -d '{"jsonrpc":"2.0","id":"demo-1","method":"SendMessage","params":{"message":{"messageId":"msg-1","role":"ROLE_USER","parts":[{"text":"hello"}]}}}'
+```
+
+Success is a response whose `result.task.status.state` is `TASK_STATE_COMPLETED` and whose Artifact text is `echo: hello`. A `404` means `rpc_url` and the advertised interface path disagree; an import failure naming Starlette means the `http-server` extra is missing.
+
+> **Production:** this baseline uses process-local task state and no authentication. The rest of this note explains the pieces; [Authentication](../05_production/01_authentication.md), [Security Hardening](../05_production/02_security_hardening.md), and [Scaling & Deployment](../05_production/03_scaling_deployment.md) own the production boundary.
 
 ⚠️ **v1.0 breaking change**: SDK 0.3 shipped wrapper classes `A2AStarletteApplication` / `A2AFastAPIApplication` with a `.build()` method. **These were removed in v1.0.** Server setup now uses route factory functions (`create_jsonrpc_routes`, `create_agent_card_routes`, `create_rest_routes`) composed directly into a plain Starlette or FastAPI app. Any tutorial showing `A2AStarletteApplication` is pre-1.0 and will not import.
 
@@ -123,7 +210,7 @@ from a2a.server.events import EventQueue
 
 ### What the executor pushes to `EventQueue`
 
-The executor never *returns* a result — it **enqueues events**. The SDK drains the queue, persists task state, and (for streaming) emits SSE frames. There are two legal event shapes:
+The executor never *returns* a result — it **enqueues events**. The SDK drains the queue, persists task state, and, for streaming, emits **Server-Sent Events (SSE)** frames. There are two legal event shapes:
 
 | Event | Meaning |
 |---|---|
@@ -225,7 +312,7 @@ class CurrencyConverterExecutor(AgentExecutor):
 Hand-building `TaskStatusUpdateEvent` objects is verbose. `a2a.server.tasks.TaskUpdater` wraps the event queue with named helpers:
 
 ```python
-from a2a.helpers import new_task_from_user_message
+from a2a.helpers import new_task_from_user_message, new_text_part
 from a2a.server.tasks import TaskUpdater
 
 async def execute(self, context, event_queue):
@@ -241,6 +328,8 @@ async def execute(self, context, event_queue):
     )
     await updater.complete()                       # -> COMPLETED  (terminal)
 ```
+
+The observable result is a Task in `TASK_STATE_COMPLETED` with a `conversion_result` Artifact containing `rate = ...`. A `NameError: new_text_part` means the helper import was omitted.
 
 `TaskUpdater` methods: `submit()`, `start_work()`, `complete()`, `failed()`, `cancel()`, `reject()`, `requires_input()`, `requires_auth()`, plus `update_status(...)` and `add_artifact(...)`.
 
@@ -317,7 +406,8 @@ app = FastAPI(routes=routes)   # then add your own @app.get(...) routes
 `agent_executor.py` plus a `__main__` entry point — a full currency-converter server.
 
 ```python
-"""Currency Converter A2A server — a2a-sdk 1.0.3. Run: python -m currency_agent"""
+"""Currency Converter A2A server — a2a-sdk 1.1.2. Run: python -m currency_agent"""
+from contextlib import asynccontextmanager
 import re
 
 import httpx
@@ -447,16 +537,23 @@ def build_app() -> Starlette:
         skills=[skill],
     )
 
+    fx_client = FxClient()
     handler = DefaultRequestHandler(
-        agent_executor=CurrencyConverterExecutor(FxClient()),
+        agent_executor=CurrencyConverterExecutor(fx_client),
         task_store=InMemoryTaskStore(),
         agent_card=agent_card,
     )
 
+    @asynccontextmanager
+    async def lifespan(app):
+        yield
+        await handler.aclose()  # drain ActiveTask work before dependencies close
+        await fx_client.aclose()  # release the owned HTTP connection pool
+
     routes: list = []
     routes.extend(create_agent_card_routes(agent_card))
     routes.extend(create_jsonrpc_routes(handler, rpc_url='/'))
-    return Starlette(routes=routes)
+    return Starlette(routes=routes, lifespan=lifespan)
 
 
 if __name__ == '__main__':
@@ -511,7 +608,7 @@ await event_queue.enqueue_event(
 )
 ```
 
-> **Key insight**: There is no "streaming mode" to opt into. The executor always emits a sequence of events; the transport decides whether to relay them as SSE or buffer them into one final response.
+There is no separate executor streaming mode. The executor emits events; the transport either relays them as SSE or buffers them into one final response.
 
 ---
 

@@ -2,7 +2,7 @@
 
 > **Who this is for**: Engineers implementing or consuming A2A who have already read the [Core Concepts](../01_fundamentals/02_core_concepts.md). You know what an agent, task, and message are — this file is the precise field-by-field reference for the document that makes an agent *discoverable*.
 
-The **Agent Card** is A2A's "digital business card": a single JSON document that tells any client what an agent is, where to reach it, how to authenticate, and what it can do. Everything in an A2A interaction starts here — a client cannot send a task until it has resolved a card. This file covers the full v1.0.0 schema, how cards are discovered, the authenticated extended card, and JWS signing.
+The **Agent Card** is A2A's "digital business card": a single JSON document that tells any client what an agent is, where to reach it, how to authenticate, and what it can do. Everything in an A2A interaction starts here — a client cannot send a task until it has resolved a card. This file targets wire protocol **1.0** and was checked against specification release **1.0.1**.
 
 ---
 
@@ -29,7 +29,7 @@ Cards change infrequently (a new skill, a changed auth requirement), so they are
 
 ---
 
-## 2. The Full AgentCard Schema (v1.0.0)
+## 2. The Full AgentCard Schema (protocol 1.0)
 
 Every field of the top-level `AgentCard` object:
 
@@ -55,11 +55,13 @@ Every field of the top-level `AgentCard` object:
 ### 2.1 AgentCapabilities
 
 ```json
+{
 "capabilities": {
   "streaming": true,
   "pushNotifications": true,
   "extendedAgentCard": false,
   "extensions": []
+}
 }
 ```
 
@@ -75,6 +77,7 @@ All capability flags are optional and **default to `false`** when absent. A clie
 ### 2.2 AgentInterface
 
 ```json
+{
 "supportedInterfaces": [
   {
     "url": "https://api.example.com/a2a/jsonrpc",
@@ -92,16 +95,19 @@ All capability flags are optional and **default to `false`** when absent. A clie
     "protocolVersion": "1.0"
   }
 ]
+}
 ```
 
-Each `AgentInterface` declares a URL, a `protocolBinding` (`JSONRPC`, `GRPC`, or `HTTP+JSON`), an optional `tenant`, and the A2A protocol version at that interface. The list is ordered: first is the server's preferred binding.
+Each `AgentInterface` declares a URL, an optional `tenant`, and the A2A protocol version at that interface. `protocolBinding` is an extensible string: `JSONRPC`, `GRPC`, and `HTTP+JSON` are the three core identifiers, while custom bindings use URI identifiers. A client skips a custom identifier it does not support and continues through the ordered list; it does not reject the whole card.
 
 ### 2.3 AgentProvider
 
 ```json
+{
 "provider": {
   "organization": "Acme FinOps Inc.",
   "url": "https://acme-finops.example.com"
+}
 }
 ```
 
@@ -124,7 +130,10 @@ A **skill** is a discrete capability. The `skills` array is what makes an agent 
     "Why was invoice INV-88213 flagged as a mismatch?"
   ],
   "inputModes": ["text/plain", "application/json", "text/csv"],
-  "outputModes": ["application/json", "text/markdown"]
+  "outputModes": ["application/json", "text/markdown"],
+  "securityRequirements": [
+    { "schemes": { "oauth2-clientcreds": { "list": ["invoices:reconcile"] } } }
+  ]
 }
 ```
 
@@ -137,8 +146,9 @@ A **skill** is a discrete capability. The `skills` array is what makes an agent 
 | `examples` | string[] | no | Sample prompts/inputs that exercise the skill. |
 | `inputModes` | string[] | no | MIME types this skill accepts; **overrides** `defaultInputModes`. |
 | `outputModes` | string[] | no | MIME types this skill produces; **overrides** `defaultOutputModes`. |
+| `securityRequirements` | `SecurityRequirement[]` | no | Schemes/scopes required for this skill; overrides the card-level default for this skill. |
 
-> **Key insight**: `inputModes`/`outputModes` on a skill *override* the card-level `defaultInputModes`/`defaultOutputModes` for that skill only. Put the common case at card level; specialize per skill (e.g. one skill that also accepts `text/csv`).
+Skill-level input/output modes and security requirements specialize that skill only. Put the common case at card level, then override the exception — for example a bulk reconciliation skill that accepts `text/csv` and requires `invoices:reconcile`.
 
 ---
 
@@ -155,10 +165,10 @@ https://{domain}/.well-known/agent-card.json
 ```
 
 ```bash
-curl -s https://acme-finops.example.com/.well-known/agent-card.json
+curl -i https://acme-finops.example.com/.well-known/agent-card.json
 ```
 
-This follows **RFC 8615** ("Well-Known URIs"). A client that only knows a domain can resolve the agent with a single HTTP GET.
+Success is `HTTP/2 200`, a schema-valid card, and at least one `supportedInterfaces` entry the client can select. A `404` usually means the server still publishes the legacy path or the reverse proxy did not route `/.well-known/agent-card.json`. If the fetch succeeds but clients keep using old metadata, inspect `ETag`/`Cache-Control` and invalidate the stale cached card.
 
 > ⚠️ **The `agent.json` gotcha**: A2A **0.2.x** and a large amount of third-party blog content, tutorials, and SDK examples still reference `/.well-known/agent.json`. **That path was renamed to `agent-card.json`.** As of v1.0.0 the canonical path is `agent-card.json` — treat `agent.json` as **legacy**. If you are consuming a third-party agent and the new path 404s, the agent may be old; if you are *publishing*, serve `agent-card.json` (optionally also serving the legacy path as a redirect for backward compatibility). Do not copy `agent.json` from an old blog post.
 
@@ -183,11 +193,13 @@ The client is handed the card (or its URL) out-of-band: a config file, environme
 `defaultInputModes` and `defaultOutputModes` are **MIME-type arrays** declaring what content the agent can consume and produce by default. They are mandatory — a client uses them to decide whether it can even talk to the agent.
 
 ```json
+{
 "defaultInputModes":  ["text/plain", "application/json"],
 "defaultOutputModes": ["application/json", "text/markdown"]
+}
 ```
 
-Resolution order for a given skill: skill-level `inputModes`/`outputModes` if present, otherwise the card-level defaults. A client constructing a message should pick a mode present in this set; sending an undeclared media type is undefined behavior.
+Resolution order for a given skill: skill-level `inputModes`/`outputModes` if present, otherwise the card-level defaults. A client constructing a message should pick a mode present in this set. An unsupported Message Part or Artifact media type maps to `ContentTypeNotSupportedError`; this is a defined protocol failure, not undefined behavior.
 
 ---
 
@@ -224,12 +236,14 @@ A card fetched over HTTPS is confidential and tamper-resistant *in transit*, but
 A2A uses **JSON Web Signature (JWS, RFC 7515)**. Signatures live in the top-level `signatures` array as `AgentCardSignature` objects, in JWS *detached* / flattened form:
 
 ```json
+{
 "signatures": [
   {
     "protected": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImtleS0yMDI2LTAxIn0",
     "signature": "MEUCIQDxr...base64url-detached-signature...Qm0g"
   }
 ]
+}
 ```
 
 | Field | Type | Purpose |
@@ -238,14 +252,15 @@ A2A uses **JSON Web Signature (JWS, RFC 7515)**. Signatures live in the top-leve
 | `signature` | string | base64url-encoded signature over the protected header + card payload. |
 | `header` | object | Optional unprotected JWS header. |
 
-Verification flow:
+Verification must reproduce the exact bytes that were signed:
 
-1. Take the AgentCard JSON **with `signatures` removed** as the JWS payload.
-2. Decode `protected` to read `alg` and `kid`.
-3. Resolve the signing public key (typically via a JWKS endpoint published by the `provider`).
-4. Verify the JWS. ✅ Valid → the card is authentic and intact. ❌ Invalid → reject the card.
+1. Parse the card while preserving Protocol Buffers field presence. Omit unset optional fields; keep explicitly set optional defaults and every required field; omit empty/default non-required fields such as an empty repeated field.
+2. Remove the top-level `signatures` field, then serialize the remaining object with **JSON Canonicalization Scheme (JCS, RFC 8785)**: lexicographically ordered keys, canonical numbers/strings, and no insignificant whitespace.
+3. Decode the protected header but do not trust it as policy. Require `typ: "JOSE"`, require `alg` to be in the verifier's configured allowlist, and resolve `kid` from a trusted key store or from a validated HTTPS `jku`. A generic `provider.url` is not a key-discovery mechanism.
+4. Reject an expired or revoked key. Construct the detached JWS signing input as `BASE64URL(protected-header-bytes) + "." + BASE64URL(canonical-card-bytes)` and verify with the selected trusted key.
+5. Accept the card only when at least one complete signature verifies under that policy; otherwise reject it.
 
-> **Key insight**: Signing matters most when cards flow through *untrusted intermediaries* — registries, caches, marketplaces. For a card fetched directly over TLS from a domain you already trust, the signature is belt-and-suspenders; for a card pulled from a public catalog, it is the trust anchor. Multiple `signatures` entries allow key rotation and multi-party attestation.
+This matters most when cards flow through untrusted registries, caches, or marketplaces. Multiple signatures support rotation and multi-party attestation, but an extra signature never excuses a failed algorithm, key-source, or canonicalization check.
 
 For how `securitySchemes`/`securityRequirements` interact with actual request authentication (OAuth2, API keys, mTLS), see [Authentication](../05_production/01_authentication.md).
 
@@ -253,7 +268,7 @@ For how `securitySchemes`/`securityRequirements` interact with actual request au
 
 ## 8. Complete Example: Invoice-Reconciliation Agent
 
-A realistic, full v1.0.0 Agent Card:
+A realistic, full protocol 1.0 Agent Card:
 
 ```json
 {
@@ -301,7 +316,14 @@ A realistic, full v1.0.0 Agent Card:
         "Why was invoice INV-88213 flagged as a mismatch?"
       ],
       "inputModes": ["text/plain", "application/json", "text/csv"],
-      "outputModes": ["application/json", "text/markdown"]
+      "outputModes": ["application/json", "text/markdown"],
+      "securityRequirements": [
+        {
+          "schemes": {
+            "oauth2-clientcreds": { "list": ["invoices:reconcile"] }
+          }
+        }
+      ]
     },
     {
       "id": "discrepancy-explainer",
@@ -347,9 +369,9 @@ A realistic, full v1.0.0 Agent Card:
 }
 ```
 
-Note how this card combines every concept above: ordered `supportedInterfaces`, capability flags explicitly set, a skill that overrides input modes with `text/csv`, an OAuth2 entry in `securitySchemes` referenced by `securityRequirements`, the extended-card opt-in, and a JWS signature for catalog trust.
+Note how this card combines every concept above: ordered `supportedInterfaces`, capability flags explicitly set, a skill that overrides input modes and narrows authorization, an OAuth2 entry referenced by card- and skill-level requirements, the extended-card opt-in, and a JWS signature for catalog trust.
 
-> 💡 Validate your card against the published JSON Schema in CI. A card that parses but is semantically wrong (stale `url`, undeclared transport, missing scope) fails clients silently at runtime — catch it at build time.
+> 💡 Validate your card against the published schema in CI, then run a selection test that proves a client can choose an advertised interface. Schema success alone does not catch a stale URL or unsupported binding. A discovery check should report the `200`, selected binding, and protocol `1.0`; a `404` or "no compatible interface" is the actionable failure.
 
 ---
 

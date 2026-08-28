@@ -18,11 +18,13 @@
 
 ---
 
-## Reading Order
+## Choose Your Framework
 
-1. **LangChain & LangGraph** — the most common starting point
-2. **Google ADK** — the framework with the deepest native A2A support
-3. **CrewAI & Others** — patterns for the rest of the ecosystem
+- **LangChain/LangGraph** → [run its minimal adapter](01_langchain_langgraph.md), then stop after exposure or continue to its remote-tool section.
+- **Google ADK** → [use ADK's native branch](02_google_adk.md), then stop after `to_a2a()` or continue to `RemoteA2aAgent`.
+- **CrewAI, Semantic Kernel, Microsoft Agent Framework, LlamaIndex, or AG2** → jump to the [branch table](03_crewai_and_others.md#choose-a-branch-before-you-read-the-implementations) and read only your framework plus the shared gotchas.
+
+For an adapter beyond those branches, return to [Building a Server](../03_python/02_building_a_server.md). For custom low-level consumption, use [Building a Client](../03_python/03_building_a_client.md).
 
 ---
 

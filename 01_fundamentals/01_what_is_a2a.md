@@ -23,7 +23,7 @@ A real workflow rarely fits inside one agent. Booking a trip involves a flights 
    Every new agent = re-wire everything it touches.
 ```
 
-This is the **agent interoperability problem**. It is the same N-squared integration trap that plagued databases before ODBC and messaging before AMQP. The fix is always the same: agree on one protocol so every participant speaks a common language.
+This is the **agent interoperability problem**. It is the same N-squared integration trap that plagued databases before **Open Database Connectivity (ODBC)** standardized database access and **Advanced Message Queuing Protocol (AMQP)** standardized messaging connections. The analogy stops at connectivity: A2A also defines agent-specific messages, task states, discovery, and results.
 
 ```
           WITH A SHARED PROTOCOL (A2A)
@@ -50,16 +50,16 @@ A2A deliberately runs on plumbing engineers already know:
 | Layer | A2A uses | Why it matters |
 |---|---|---|
 | Transport | HTTP / HTTPS | No new ports, proxies, or tooling |
-| RPC | JSON-RPC 2.0 | Plain request/response, easy to debug |
-| Streaming | Server-Sent Events (SSE) | Incremental updates for long tasks |
+| Bindings | JSON-RPC, gRPC, HTTP+JSON | Three standard ways to map the same operations onto the wire |
+| Streaming | Server-Sent Events (SSE) where the binding uses HTTP streaming | Incremental updates for long tasks |
 | Discovery | **Agent Cards** | Machine-readable capability, transport, and auth metadata |
 | Integrity | Optional signed Agent Cards | Tamper evidence when cards move through registries or caches |
 
-Because the wire format is just HTTP and JSON, an A2A agent is — from the outside — an ordinary web service. Your existing load balancers, API gateways, auth middleware, and observability stack all work unchanged.
+The simplest baseline uses **JSON-RPC** — remote procedure calls encoded as JSON — over HTTP. A2A 1.0 also standardizes gRPC and HTTP+JSON bindings, so clients select an advertised interface rather than assuming every server uses JSON-RPC. In every case, an A2A agent still looks like an ordinary network service to load balancers, gateways, authentication middleware, and observability tooling.
 
 A2A defines a small set of primitives — Agent Cards, Tasks, Messages, Artifacts — covered in detail in [Core Concepts](02_core_concepts.md). For now, the mental model is enough: **one agent (a client) sends a task to another agent (a server) over HTTP and receives results back.**
 
-> **Key insight**: A2A's most underrated design choice is being *boring*. Reusing HTTP, JSON-RPC, and SSE means there is almost nothing new to learn at the transport layer — the novelty is entirely in the agent semantics.
+The deliberately familiar transport layer keeps the novelty in agent discovery, messages, task state, and artifacts rather than in new network plumbing.
 
 ---
 
@@ -88,7 +88,7 @@ A2A moved from a Google announcement to a vendor-neutral foundation project, the
 
 The Linux Foundation move matters: it means no single vendor controls the standard. A2A is now governed like Kubernetes or Linux itself — by an open, multi-stakeholder process.
 
-> **Key insight**: Apache 2.0 + Linux Foundation governance is what makes A2A safe to build a business on. Competitors can adopt it without ceding control to a rival, which is precisely why adoption accelerated.
+Apache 2.0 licensing and Linux Foundation governance let competitors adopt the protocol without ceding control to a rival.
 
 ---
 
@@ -121,10 +121,12 @@ A2A treats every remote agent as a black box. A client agent sees only the *decl
         only declared capabilities cross the boundary
 ```
 
-This is what separates A2A from "wrap the other agent as a function I call." Opacity gives you two things at once:
+This is what separates A2A from "wrap the other agent as a function I call." Interface opacity gives you one architectural property: the caller depends on declared capabilities and outputs rather than on the implementation.
 
-- ✅ **IP protection** — vendors expose a capability without revealing how it works.
-- ✅ **Security** — a caller cannot reach into another agent's tools or data.
+- **IP protection** — vendors can expose a capability without publishing how it works.
+- **Loose coupling** — implementations can change while the advertised contract remains stable.
+
+Opacity is not an access-control boundary. A2A does not inspect or isolate the remote agent's implementation, and a badly designed server can still expose internal tools or cross-tenant data. Authentication, authorization, least privilege, and server-side process/data isolation are the controls that prevent that access; see [Authentication](../05_production/01_authentication.md) and [Security Hardening](../05_production/02_security_hardening.md).
 
 > **Principle**: In A2A, agents are **autonomous peers**, not tools. A peer is asked to *accomplish a goal*; a tool is *invoked with arguments*. That distinction drives the whole protocol — and is the cleanest way to tell A2A apart from MCP (see [A2A vs MCP](03_a2a_vs_mcp.md)).
 
@@ -146,7 +148,7 @@ A2A is one layer in a larger stack. It does not replace models, frameworks, or t
    └─────────────────────────────────────────────┘
 ```
 
-The two protocol layers answer different questions:
+Here **Model Context Protocol (MCP)** is the standard an agent uses to reach tools and data. The two protocol layers answer different questions:
 
 | Question | Protocol |
 |---|---|
@@ -155,7 +157,7 @@ The two protocol layers answer different questions:
 
 They are complementary, not competing. A single agent commonly uses **MCP internally** to call its own tools, and **A2A externally** to delegate sub-tasks to other agents. The full comparison lives in [A2A vs MCP](03_a2a_vs_mcp.md).
 
-> **Key insight**: MCP connects an agent *downward* to tools. A2A connects an agent *sideways* to peers. Most production systems need both.
+MCP connects an agent *downward* to tools; A2A connects it *sideways* to peers. Many production systems use both.
 
 ---
 
@@ -165,7 +167,7 @@ A2A's traction is unusually fast for a protocol this young.
 
 - **150+ organizations** support A2A by 2026 — including AWS, Cisco, Google, IBM, Microsoft, Salesforce, SAP, and ServiceNow — up from ~50 at launch.
 - It is integrated into major cloud platforms and has reached **enterprise production use** within its first year.
-- **Five official SDKs**, maintained under the `a2aproject` organization, implement the same canonical data model:
+- **Six official SDKs**, maintained under the `a2aproject` organization, target the same canonical data model, although features and release maturity can differ:
 
 | SDK | Notes |
 |---|---|
@@ -174,10 +176,11 @@ A2A's traction is unusually fast for a protocol this young.
 | **Java** | Enterprise JVM stacks |
 | **Go** | High-throughput services |
 | **.NET** | Microsoft ecosystem |
+| **Rust** | Systems services and embedded runtimes |
 
-Because all five SDKs target the same spec, an agent written in Go can call an agent written in Python with no special bridging — which is the entire point of the protocol.
+Because all six SDKs target the same protocol, an agent written in Go can call an agent written in Python with no language-specific bridge. Verify the feature and binding you need against the particular SDK release rather than assuming identical maturity.
 
-> **Key insight**: A protocol is only as useful as its implementations. Five vendor-neutral SDKs across the dominant backend languages mean you can adopt A2A in your existing stack instead of changing it.
+A protocol becomes practical when it has implementations in the languages teams already run; the SDKs reduce adoption cost without changing the wire contract.
 
 ---
 
@@ -196,7 +199,7 @@ A2A is not the answer to every integration. Use this to decide:
 
 ⚠️ **Common mistake**: reaching for A2A when you only need a tool call. If the remote thing has no autonomy — it just executes with arguments — it is a tool, and MCP or a plain API is the simpler choice.
 
-> **Key insight**: A2A earns its keep when the other side is *autonomous* — it decides how to accomplish a goal, may take time, and you should not (or cannot) see inside it. Anything less, and a simpler integration wins.
+A2A earns its keep when the other side is autonomous: it decides how to accomplish a goal, may take time, and owns its implementation. Anything less usually deserves a simpler integration.
 
 ---
 

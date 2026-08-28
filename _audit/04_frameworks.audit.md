@@ -1,0 +1,40 @@
+# 04_frameworks/README.md (33 lines)
+ORDERING: n/a (role pure folder index/link list).
+EXPLANATION: n/a (role pure folder index/link list).
+Summary: 0 critical, 0 high, 0 med, 0 low
+
+NO-ACTION: The index stays within its navigation role, names the prerequisites, and links every note in the folder.
+
+# 04_frameworks/01_langchain_langgraph.md (533 lines)
+ORDERING: role integration tutorial; payoff line 260/533 (0.488, FAIL); opening payoff FAIL; length budget FAIL.
+EXPLANATION: register 12:25 (PASS; 12 markers/25 explanatory paragraphs); restatement PASS; unglossed first uses 0; unexplained rules/defenses 0; concrete-carrier gaps 0; intuition-building explanation yes.
+Summary: 2 critical, 1 high, 3 med, 1 low
+
+FIX-CRITICAL: Lines 289–303 are toy-not-correct: `StateSnapshot` has no `tasks_pending`, and the current interrupt payload lives in `state.interrupts` (or in the v2/v3 stream interrupt surface), not `state.values["__interrupt__"]`; replace the block with one current, executable resume example using `state.interrupts` or `stream_events(..., version="v3")`, because the shown branch raises `AttributeError` when copied. Source: https://reference.langchain.com/python/langgraph/types/StateSnapshot (checked 2026-08-28).
+FIX-CRITICAL: Lines 194–197 and 518–526 raise the protobuf `InternalError` message directly and also forward `str(e)` to the caller; use `raise ServerError(error=InternalError()) from e` or emit `updater.failed(...)`, keep the detailed exception only in server logs, and show the resulting failed Task/error response. The official A2A sample uses the `ServerError` wrapper. Source: https://github.com/a2aproject/a2a-samples/blob/main/samples/python/agents/langgraph/app/agent_executor.py (checked 2026-08-28).
+FIX-HIGH: The first assembled server appears at line 260 (48.8% into the note), and the tutorial never gives a client-observed success check; move a minimal three-file baseline, start command, card fetch, one request, and expected terminal result into the first quarter, then explain mappings and harden interrupts/streaming afterward.
+FIX-MED: Lines 11, 69, 97, 432, and 435 teach `langgraph.prebuilt.create_react_agent` as the current constructor even though it is deprecated; migrate the main examples to `langchain.agents.create_agent` (including `system_prompt=`) and keep the legacy name only in a clearly dated migration note. Sources: https://langchain-ai.github.io/langgraph/reference/agents/ and https://docs.langchain.com/oss/python/langchain/agents (checked 2026-08-28).
+FIX-MED: Lines 444 and 482–509 categorically say a synchronous LangChain `@tool` blocks the event loop, but current `Tool.ainvoke`/`BaseTool._arun` offloads a sync callable through `run_in_executor`; rewrite this as a scalability/thread-pool warning, and reserve the event-loop-stall claim for blocking I/O executed directly inside an async node/coroutine. Source: https://github.com/langchain-ai/langchain/blob/master/libs/core/langchain_core/tools/simple.py (checked 2026-08-28).
+FIX-MED: The file is 533 lines with no `<!-- length-justification: ... -->`; add the required justification or split hosted Agent Server and advanced streaming/HITL material into focused notes.
+FIX-LOW: The file contains three `Key insight` callouts (lines 308, 442, and 529); keep one transferable note-level insight and demote the others to ordinary explanatory text.
+
+# 04_frameworks/02_google_adk.md (395 lines)
+ORDERING: role integration tutorial; payoff line 99/395 (0.251, PASS); opening payoff PASS; length budget PASS.
+EXPLANATION: register 11:29 (PASS; 11 markers/29 explanatory paragraphs); restatement PASS; unglossed first uses 0; unexplained rules/defenses 0; concrete-carrier gaps 0; intuition-building explanation yes.
+Summary: 1 critical, 0 high, 1 med, 1 low
+
+FIX-CRITICAL: Lines 209–234 are toy-not-correct: `A2aRemoteAgentConfig.request_interceptors` expects ADK `RequestInterceptor` models whose `before_request` callable receives `(InvocationContext, A2AMessage, ParametersConfig)` and returns a message/event plus parameters; the shown object with `before_request(request)` mutating `request.headers` does not implement that contract and will not attach the bearer token. Replace it with the current supported auth/interceptor construction and an observed authenticated request, keeping the token in `os.environ`. Source: https://github.com/google/adk-python/blob/main/src/google/adk/a2a/agent/config.py (checked 2026-08-28).
+FIX-MED: Line 5's unqualified claim that ADK has the deepest native A2A integration is no longer a stable comparison: current AG2 exposes JSON-RPC, REST, and gRPC plus task/push, reconnect, HITL, security, and extension APIs; replace the superlative with a dated, criteria-based comparison or scope it to ADK's `to_a2a`/`RemoteA2aAgent` ergonomics. Source: https://docs.ag2.ai/docs/user-guide/a2a/server/ (checked 2026-08-28).
+FIX-LOW: The file has two `Key insight` callouts (lines 57 and 359); retain the Event-to-Task projection as the note-level insight and render the resume invariant as a normal failure-mode explanation.
+
+# 04_frameworks/03_crewai_and_others.md (348 lines)
+ORDERING: role framework decision guide and integration reference; payoff line 326/348 (0.937, FAIL); opening payoff FAIL; length budget PASS.
+EXPLANATION: register 13:30 (PASS; 13 markers/30 explanatory paragraphs); restatement PASS; unglossed first uses 0; unexplained rules/defenses 0; concrete-carrier gaps 2; intuition-building explanation yes.
+Summary: 3 critical, 2 high, 0 med, 1 low
+
+FIX-CRITICAL: Lines 89–93 are toy-not-correct: `InvalidParamsError` is an A2A error payload, not the exception wrapper expected by the v1 server path; change the branch to `raise ServerError(error=InvalidParamsError())`, import `ServerError`, and show that invalid input returns the intended protocol error instead of Python's “exceptions must derive from BaseException”. Source: https://github.com/a2aproject/a2a-samples/blob/main/samples/python/agents/langgraph/app/agent_executor.py (checked 2026-08-28).
+FIX-CRITICAL: Lines 205–228 and 244–264 present copyable Python blocks with undefined `_status_update`/`_completed` helpers, and the Semantic Kernel block explicitly omits the correctness-critical terminal artifact/status; either supply the smallest faithful A2A event constructors through exactly one terminal state or label both blocks “explanatory excerpt — not runnable” and link the canonical complete owners.
+FIX-CRITICAL: Lines 274–315 and the comparison row at line 332 teach the AG2 Classic `autogen.a2a.A2aAgentServer`/`A2aRemoteAgent` API as current; the current AG2 path uses `ag2.Agent`, `ag2.a2a.A2AServer`, `build_card`, and client-side `A2AConfig`, so the shown imports fail for readers installing current AG2. Replace the baseline with the current API and isolate the old API under an explicitly version-pinned “AG2 Classic” migration subsection. Sources: https://docs.ag2.ai/docs/user-guide/a2a/server/ and https://docs.ag2.ai/docs/user-guide/a2a/client/ (checked 2026-08-28).
+FIX-HIGH: Lines 196–200 and comparison line 330 say Microsoft Agent Framework's Python A2A support is still “coming/catching up”; current Python ships an `A2AAgent` consumer and native A2A hosting samples/adapters, including the stable 1.12.x line, so update both the narrative and table and give the current Python path rather than only .NET. Sources: https://github.com/microsoft/agent-framework/blob/main/python/samples/02-agents/a2a/README.md and https://github.com/microsoft/agent-framework/blob/main/python/samples/04-hosting/a2a/agent_framework_to_a2a.py (checked 2026-08-28).
+FIX-HIGH: The decision payoff is the integration-state table at line 326 (93.7% into a decision guide); move a corrected, dated comparison and default recommendations directly after the general adapter pattern, then put framework-specific implementation sketches and gotchas behind those choices in do → understand → harden order.
+FIX-LOW: The file has two `Key insight` callouts (lines 54 and 318); keep the adapter mental model as the single note-level insight and convert the AG2 observation to normal prose.

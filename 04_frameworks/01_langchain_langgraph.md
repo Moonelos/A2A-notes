@@ -1,14 +1,96 @@
 # A2A with LangChain / LangGraph
 
+<!-- length-justification: This integration note keeps the baseline adapter, checkpoint/interrupt mapping, streaming bridge, reverse client tool, and hosted alternative together because they share one context and lifecycle mapping. -->
+
 > **Who this is for**: Engineers who build agents with LangChain/LangGraph and want to expose them over A2A — and call remote A2A agents from inside a graph. You should have read **[Building a Server](../03_python/02_building_a_server.md)** and **[Building a Client](../03_python/03_building_a_client.md)** first; this file assumes you know `AgentExecutor`, `RequestContext`, `EventQueue`, and the A2A client API.
 
-There is **no `langchain-a2a` package**. Integration is hand-written glue: the A2A server side uses `a2a-sdk` (1.0.x), and the LangGraph side is plain LangGraph. The one piece of "native" support is LangSmith's hosted **Agent Server**, which exposes any deployed graph at `/a2a/{assistant_id}` — covered in §6. The canonical reference implementation is the LangGraph **currency agent** in `a2aproject/a2a-samples` (`samples/python/agents/langgraph/`).
+There is no separate `langchain-a2a` package. A small `AgentExecutor` adapter maps LangGraph output onto A2A Task events; LangSmith's hosted Agent Server is the managed alternative.
+
+## Quick start: expose one LangChain agent
+
+You need `OPENAI_API_KEY` plus `a2a-sdk[http-server]==1.1.2`, `langchain`, `langchain-openai`, and `uvicorn`. Save this one-file baseline as `langgraph_a2a.py`:
+
+```python
+from contextlib import asynccontextmanager
+
+import uvicorn
+from langchain.agents import create_agent
+from starlette.applications import Starlette
+
+from a2a.helpers import new_task_from_user_message, new_text_part
+from a2a.server.agent_execution import AgentExecutor
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
+from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
+from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill
+
+graph = create_agent(
+    model="openai:gpt-4.1-mini",
+    tools=[],
+    system_prompt="Answer in one short sentence.",
+)
+
+
+class LangGraphExecutor(AgentExecutor):
+    async def execute(self, context, event_queue) -> None:
+        task = context.current_task or new_task_from_user_message(context.message)
+        await event_queue.enqueue_event(task)
+        updater = TaskUpdater(event_queue, task.id, task.context_id)
+        await updater.start_work()
+        result = await graph.ainvoke({
+            "messages": [{"role": "user", "content": context.get_user_input()}]
+        })
+        await updater.add_artifact(
+            [new_text_part(result["messages"][-1].content)], name="answer"
+        )
+        await updater.complete()
+
+    async def cancel(self, context, event_queue) -> None:
+        task = context.current_task
+        await TaskUpdater(event_queue, task.id, task.context_id).cancel()
+
+
+card = AgentCard(
+    name="LangGraph Answer Agent",
+    description="Answers short questions through a LangChain agent graph.",
+    version="0.1.0",
+    supported_interfaces=[AgentInterface(
+        url="http://127.0.0.1:10000", protocol_binding="JSONRPC", protocol_version="1.0"
+    )],
+    capabilities=AgentCapabilities(),
+    default_input_modes=["text/plain"],
+    default_output_modes=["text/plain"],
+    skills=[AgentSkill(
+        id="answer", name="Answer", description="Answer a question.", tags=["qa"]
+    )],
+)
+handler = DefaultRequestHandler(LangGraphExecutor(), InMemoryTaskStore(), card)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    await handler.aclose()
+
+
+app = Starlette(
+    routes=[*create_agent_card_routes(card), *create_jsonrpc_routes(handler, rpc_url="/")],
+    lifespan=lifespan,
+)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=10000)
+```
+
+Start it with `python langgraph_a2a.py`, then send the versioned JSON-RPC request from the Python client quick start. Success is a `TASK_STATE_COMPLETED` Task with an `answer` Artifact. A `401` from the model provider means the model credential is missing; a Task stuck in `WORKING` means the adapter failed to emit `complete()` or `failed()`.
+
+> **Production:** this baseline has no persistent checkpointer or authentication. The rest of the note explains mapping, interrupts, streaming, and remote-agent tools before production deployment.
 
 ---
 
 ## 1. The integration pattern
 
-A LangGraph app is a compiled `StateGraph` (or a prebuilt `create_react_agent`). A2A doesn't know about graphs — it knows about **Tasks**, **states**, and **artifacts**. The integration is one adapter class that implements `a2a.server.agent_execution.AgentExecutor` and drives the graph.
+A LangGraph app is a compiled `StateGraph` or an agent created with `langchain.agents.create_agent`. A2A does not know about graphs — it knows about Tasks, states, and artifacts. One adapter implements `AgentExecutor` and drives the graph.
 
 ```
 ┌─────────────────── A2A Server (a2a-sdk) ───────────────────┐
@@ -66,7 +148,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
 from pydantic import BaseModel
 
 memory = MemorySaver()  # swap for AsyncPostgresSaver in production
@@ -94,11 +176,11 @@ class CurrencyAgent:
     SUPPORTED_CONTENT_TYPES = ["text", "text/plain"]
 
     def __init__(self) -> None:
-        self.graph = create_react_agent(
-            ChatOpenAI(model="gpt-4o", temperature=0),
+        self.graph = create_agent(
+            model=ChatOpenAI(model="gpt-4o", temperature=0),
             tools=[get_exchange_rate],
             checkpointer=memory,
-            prompt="You are a currency-conversion assistant.",
+            system_prompt="You are a currency-conversion assistant.",
             # response_format forces a typed result the executor can branch on.
             response_format=ResponseFormat,
         )
@@ -131,7 +213,7 @@ class CurrencyAgent:
         return {"done": False, "needs_input": True, "content": result.message}
 ```
 
-**`agent_executor.py`** — the A2A adapter. Imports/APIs below are verified against the `a2a-sdk` v1.0.3 source:
+**`agent_executor.py`** — the A2A adapter. Imports/APIs below target the repository's `a2a-sdk` 1.1.2 baseline:
 
 ```python
 import logging
@@ -141,6 +223,7 @@ from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
 from a2a.helpers.proto_helpers import new_task_from_user_message
 from a2a.types import InternalError, Part, TaskState, UnsupportedOperationError
+from a2a.utils.errors import ServerError
 
 from app.agent import CurrencyAgent
 
@@ -193,12 +276,12 @@ class CurrencyAgentExecutor(AgentExecutor):
 
         except Exception as e:
             logger.exception("LangGraph execution failed")
-            # ⚠️ Surface the failure as A2A `failed`, not a silent hang.
-            raise InternalError(message=str(e)) from e
+            # Keep details in server logs; the protocol gets a stable generic error.
+            raise ServerError(error=InternalError()) from e
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         # LangGraph has no built-in mid-run cancel; reject unless you wire one.
-        raise UnsupportedOperationError(message="cancel not implemented")
+        raise ServerError(error=UnsupportedOperationError(message="cancel not implemented"))
 ```
 
 **`__main__.py`** — wire it into a Starlette app. In v1.0 the server app classes
@@ -286,7 +369,7 @@ async def stream(self, query: str, context_id: str):
     config = {"configurable": {"thread_id": context_id}}
 
     # Resume a paused graph, or start a fresh run.
-    state = self.graph.get_state(config)
+    state = await self.graph.aget_state(config)
     if state.next:                       # graph is parked at an interrupt
         graph_input = Command(resume=query)
     else:
@@ -296,16 +379,17 @@ async def stream(self, query: str, context_id: str):
         ...
 
     # After the stream ends, check whether the graph hit a fresh interrupt.
-    state = self.graph.get_state(config)
-    if "__interrupt__" in state.tasks_pending or state.next:
-        interrupt_payload = state.values.get("__interrupt__")  # what the node asked
+    state = await self.graph.aget_state(config)
+    if state.interrupts:
+        # StateSnapshot.interrupts is the current public interrupt surface.
+        interrupt_payload = [interrupt.value for interrupt in state.interrupts]
         yield {"done": False, "needs_input": True,
                "content": str(interrupt_payload)}
 ```
 
 The executor side is unchanged — `needs_input` still drives `update_status(TaskState.TASK_STATE_INPUT_REQUIRED, msg)`.
 
-> **Key insight**: `input-required` is *not* a failure and *not* a completion. It's a Task that is alive but waiting. The `contextId` keeps the checkpoint addressable so the next message resumes exactly where `interrupt()` parked the graph.
+`input-required` is neither failure nor completion. The Task is alive but waiting, and `contextId` keeps the checkpoint addressable for the next Message.
 
 ⚠️ If you drop the `contextId` → `thread_id` mapping (e.g. generate a new UUID per request), the resume reads an empty checkpoint and the graph restarts from scratch — silently losing the conversation.
 
@@ -429,19 +513,19 @@ async def ask_currency_agent(question: str) -> str:
 Now attach the tool to the local graph — the remote A2A agent is indistinguishable from a normal tool:
 
 ```python
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
-orchestrator = create_react_agent(
-    ChatOpenAI(model="gpt-4o"),
+orchestrator = create_agent(
+    model=ChatOpenAI(model="gpt-4o"),
     tools=[ask_currency_agent],          # remote A2A agent, exposed as a tool
-    prompt="Route currency questions to the currency agent.",
+    system_prompt="Route currency questions to the currency agent.",
 )
 ```
 
-> **Key insight**: An A2A agent and a local Python function look the same to the LLM once both are `@tool`s. A2A's value is *not* a new programming model — it's that the tool's implementation can be a separately deployed, separately scaled, possibly third-party agent.
+An A2A agent and a local Python function can look alike after both are wrapped as tools. A2A adds the separately deployed peer contract behind that wrapper.
 
-⚠️ The tool **must be `async`** (`async def` + awaited inside the node). LangGraph runs async tools on the event loop — see §7 for what happens if you use a blocking client instead.
+⚠️ Prefer an async tool for network calls. Current LangChain can offload a synchronous `@tool` through its executor, but that consumes the shared thread pool and becomes a scalability limit. Blocking I/O executed directly inside an async node or coroutine still stalls the event loop.
 
 💡 Resolving the `AgentCard` on every call is wasteful. In production, resolve cards once at startup and cache `agent_card` (and the `httpx.AsyncClient`) so each tool call is just a `send_message`.
 
@@ -456,7 +540,7 @@ POST /a2a/{assistant_id}                       # platform-documented: message/se
 GET  /.well-known/agent-card.json?assistant_id={assistant_id}
 ```
 
-Requirements and config (verified May 2026):
+Requirements and config (checked August 2026):
 
 - Needs `langgraph-api >= 0.4.21`.
 - A2A is **on by default**. Disable it per-deployment in `langgraph.json`:
@@ -467,7 +551,7 @@ Requirements and config (verified May 2026):
 }
 ```
 
-⚠️ As of May 2026, LangChain's Agent Server A2A docs still show v0.3-style JSON-RPC method names (`message/send`, `message/stream`, `tasks/get`) and `kind`-tagged parts. Treat the hosted endpoint as a platform compatibility surface; fetch its card and test the exact methods it advertises before mixing it with strict v1.0 clients. The hand-written executor examples above target `a2a-sdk` v1.0.3 and use the v1 protobuf model.
+⚠️ Hosted framework endpoints are platform compatibility surfaces. Fetch the deployed card and test the exact version, binding, methods, and part shapes it advertises before mixing it with strict 1.0 clients. The hand-written executor examples above target `a2a-sdk` 1.1.2 and the 1.0 protobuf model.
 
 The hosted server maps Agent Server runs onto A2A Tasks for you. The trade-off vs. a hand-written executor: you give up control over the LangGraph-output → artifact mapping (§1) and over interrupt handling (§3). For full control — custom artifact names, multi-part outputs, bespoke interrupt payloads — write the `AgentExecutor` yourself as in §2.
 
@@ -479,24 +563,20 @@ The hosted server maps Agent Server runs onto A2A Tasks for you. The trade-off v
 
 | Failure                                  | Symptom                                              | Fix                                                                 |
 |-------------------------------------------|------------------------------------------------------|----------------------------------------------------------------------|
-| Blocking call inside a graph node         | Event loop stalls; SSE stream freezes for all clients | Use `graph.astream` / `ainvoke`; async tools; async A2A client       |
+| Blocking I/O directly inside an async node | Event loop stalls; SSE stream freezes for all clients | Use `graph.astream` / `ainvoke` and async clients; bound any sync-tool thread pool |
 | Lost `contextId` ↔ `thread_id` mapping    | Multi-turn "forgets"; interrupts restart the graph    | Always set `thread_id = task.context_id` in the checkpointer config  |
-| Error swallowed instead of propagated     | Task stuck in `working` forever; client times out     | Catch in `execute`, `raise InternalError(...)`       |
+| Error swallowed instead of propagated     | Task stuck in `working` forever; client times out     | Call `updater.failed(...)` or raise `ServerError(error=InternalError())` |
 | Stream ends without a terminal state      | SSE connection hangs until client timeout             | Always reach a terminal state: `updater.complete()`, `updater.failed()`, or `update_status(TASK_STATE_INPUT_REQUIRED, ...)` |
 | In-memory checkpointer in production      | Conversation state lost on restart / not shared       | Use `AsyncPostgresSaver` (or another persistent checkpointer)        |
 | `cancel()` not implemented                | Client cancel is a silent no-op                       | Implement `cancel`, or explicitly reject with `UnsupportedOperationError` |
 
-**Blocking calls** — the most common production bug. ❌ Anti-pattern:
+**Blocking calls** — distinguish an offloaded sync tool from blocking I/O inside an async node. The latter stalls every coroutine on that event loop:
 
 ```python
-# ❌ httpx.get / graph.invoke / time.sleep block the event loop.
-#    Every concurrent A2A request on this server stalls.
-@tool
-def lookup(q: str) -> str:
-    return httpx.get(url).text          # SYNC call inside async server
-
-async for item in self.agent.stream(...):   # but stream() calls graph.invoke()
-    ...
+# ❌ Direct sync I/O inside a coroutine blocks the event loop.
+async def lookup_node(state):
+    response = httpx.get(url)  # no executor boundary here
+    return {"result": response.text}
 ```
 
 ✅ Correct — async all the way down:
@@ -521,10 +601,11 @@ try:
         ...
 except Exception as e:
     logger.exception("graph failed")
-    # updater.failed(...) OR raise an A2AError subclass —
-    # DefaultRequestHandler turns it into a JSON-RPC error response.
-    raise InternalError(message=str(e)) from e
+    # The caller receives a stable generic error; details remain in logs.
+    raise ServerError(error=InternalError()) from e
 ```
+
+The client observes a failed Task or the binding's internal-error response without receiving `str(e)`, which may contain prompts, URLs, or credentials.
 
 > **Key insight**: Every code path through `execute` must end the Task in a terminal or interrupted state — `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, or `TASK_STATE_INPUT_REQUIRED`. A Task left in `TASK_STATE_WORKING` is invisible breakage: no error, no result, just a client waiting.
 

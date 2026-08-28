@@ -4,7 +4,7 @@
 
 A2A (Agent2Agent) is a protocol for one autonomous agent to discover, call, and collaborate with another over HTTP. To do that, both sides must agree on a small set of nouns: who the participants are, how they advertise themselves, and the shape of the data that flows between them.
 
-This file defines that vocabulary against the **v1.0.0 specification** (`a2a-protocol.org/latest/specification/`). Treat it as the dictionary you keep open while reading everything else.
+This file targets wire protocol **1.0** and was checked against specification release **1.0.1**. Treat it as the dictionary you keep open while reading everything else.
 
 ---
 
@@ -15,7 +15,7 @@ A2A is a client–server protocol. Every interaction has exactly two participant
 - **A2A Server** — also called the **remote agent**. It is the agent being called. It hosts an HTTP endpoint, publishes an **Agent Card**, receives requests, runs work, and returns Tasks, Messages, and Artifacts.
 - **A2A Client** — the calling agent or application. It discovers a server via its Agent Card, then sends requests to that server's endpoint and consumes the responses.
 
-> **Key insight**: The roles are per-conversation, not permanent. An agent that is a *server* to a user-facing app can simultaneously be a *client* of three other specialist agents it delegates to. A2A is designed for these chains of delegation.
+The roles are per-conversation, not permanent. An agent that is a server to a user-facing app can simultaneously be a client of specialist agents it delegates to.
 
 ```
    User-facing app                  Specialist agent
@@ -70,11 +70,11 @@ It declares, at minimum:
   "securityRequirements": [
     { "schemes": { "bearer": { "list": [] } } }
   ],
-  "skills": [ /* AgentSkill objects — see next section */ ]
+  "skills": []
 }
 ```
 
-> **Key insight**: The Agent Card is to A2A what an OpenAPI spec is to a REST API — a machine-readable contract. A client should never hardcode a server's behavior; it should read the card.
+An Agent Card is analogous to an OpenAPI document only as machine-readable discovery. The analogy stops at granularity: a card advertises coarse skills, interfaces, and security requirements; it does not define every operation's request and response schema. Clients should read the card instead of hardcoding endpoints or capabilities.
 
 This is only a sketch. The full card structure — signatures, extended cards, transport negotiation — is covered in **[The Agent Card](../02_protocol/01_agent_card.md)**.
 
@@ -109,7 +109,7 @@ An **AgentSkill** is one discrete capability the agent advertises inside its Age
 }
 ```
 
-> **Key insight**: `inputModes` / `outputModes` are *MIME types*, not free-form labels. They tell the client what content it may send in (text, images, audio) and what to expect back — the basis for multi-modal interaction.
+`inputModes` and `outputModes` are media types, not free-form labels. They tell the client what it may send and what the skill can return.
 
 ---
 
@@ -134,15 +134,15 @@ A **Task** is the central object of A2A. When a client asks a server to *do some
     "state": "working",
     "timestamp": "2026-05-18T14:03:11Z"
   },
-  "history": [ /* Message objects */ ],
-  "artifacts": [ /* Artifact objects */ ],
+  "history": [],
+  "artifacts": [],
   "metadata": { "priority": "normal" }
 }
 ```
 
-The `status.state` field moves through ProtoJSON enum values like `TASK_STATE_SUBMITTED`, `TASK_STATE_WORKING`, `TASK_STATE_INPUT_REQUIRED`, `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, and `TASK_STATE_CANCELED`. Not every interaction needs a Task — a quick question may be answered with a single Message and no Task at all. The full state machine and when a Task is created is covered in **[Task Lifecycle](../02_protocol/03_task_lifecycle.md)**.
+The `status.state` field uses **ProtoJSON**, Protocol Buffers' canonical mapping to JSON. That mapping is why the wire carries strings such as `TASK_STATE_SUBMITTED`, `TASK_STATE_WORKING`, `TASK_STATE_INPUT_REQUIRED`, `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, and `TASK_STATE_CANCELED` rather than Python enum names or arbitrary lowercase labels. Not every interaction needs a Task — a quick question may be answered with a single Message and no Task at all. The full state machine is covered in **[Task Lifecycle](../02_protocol/03_task_lifecycle.md)**.
 
-> **Key insight**: A Task is *long-lived and resumable*. Because the server owns the `id`, a client can disconnect, reconnect later, and poll the same Task by its `id` — essential for long-running agent work.
+A Task is long-lived and server-owned. Its stable `id` lets a client reconnect and observe the same work later.
 
 ---
 
@@ -172,7 +172,7 @@ A **Message** represents a single turn in the conversation between client and se
 }
 ```
 
-> **Key insight**: `role` is always relative to the protocol, not the human. `ROLE_USER` means "the calling side of this A2A exchange" — even when that caller is itself an autonomous agent with no human in the loop.
+`role` is relative to the protocol, not to a human. `ROLE_USER` means the calling side of this A2A exchange even when that caller is another autonomous agent.
 
 ---
 
@@ -186,25 +186,35 @@ A **Part** is the smallest piece of content. Every Message and every Artifact ca
 
 ⚠️ **v1.0 change**: In v1.0 these are *not* three separate object types. The spec defines a **single unified `Part`** object, and the kind is determined by **which field is present** — there is no `kind` discriminator field (that field existed in pre-1.0 drafts and was removed). Likewise `mimeType` was renamed to `mediaType`.
 
-```json
-// Text content — "text" field present
-{ "text": "Kyoto is best visited in November for autumn foliage." }
+Text Part:
 
-// File content by reference — "url" field present
+```json
+{ "text": "Kyoto is best visited in November for autumn foliage." }
+```
+
+File Part by reference:
+
+```json
 {
   "url": "https://cdn.example.com/itinerary.pdf",
   "mediaType": "application/pdf",
   "filename": "itinerary.pdf"
 }
+```
 
-// File content inline — "raw" field present (base64-encoded bytes)
+File Part inline, with base64-encoded bytes in `raw`:
+
+```json
 {
   "raw": "JVBERi0xLjcKJ...",
   "mediaType": "application/pdf",
   "filename": "itinerary.pdf"
 }
+```
 
-// Data content — "data" field present
+Data Part:
+
+```json
 {
   "data": {
     "destination": "Kyoto",
@@ -223,7 +233,7 @@ else if ("raw" in part)    -> inline file bytes (base64)
 else if ("url" in part)    -> file by reference
 ```
 
-> **Key insight**: A single Message can mix Part kinds — e.g. text instructions plus structured `data` parameters plus a file attachment. This is how A2A carries multi-modal, structured interactions in one turn.
+A single Message can mix Part kinds, such as text instructions, structured `data`, and a file attachment.
 
 ---
 
@@ -252,7 +262,7 @@ An **Artifact** is a concrete result produced by a Task — a generated report, 
 }
 ```
 
-> **Key insight**: Messages are how agents *talk*; Artifacts are what they *produce*. A Task's `history` holds the conversation; its `artifacts` hold the results. Both are just containers of Parts.
+Messages are how agents talk; Artifacts are what they produce. A Task's `history` holds the conversation, while `artifacts` holds results.
 
 ---
 
@@ -270,7 +280,7 @@ contextId: "ctx-trip-planning-42"
    └── Message msg-118    ("also add a car")      role: ROLE_USER
 ```
 
-> **Key insight**: `id` (or `taskId`) scopes a *single piece of work*; `contextId` scopes a *whole conversation*. A long collaboration has one stable `contextId` and many short-lived Task `id`s underneath it.
+`id` (or `taskId`) scopes one piece of work; `contextId` scopes a conversation that may contain several Tasks.
 
 ---
 
@@ -299,7 +309,7 @@ Read it as two sentences:
 - **Task → Message → Part** — the *conversation* path: what was said, turn by turn.
 - **Task → Artifact → Part** — the *output* path: what was produced.
 
-> **Key insight**: Learn `Part` well. Every payload a client sends or a server returns — questions, files, structured parameters, finished results — is ultimately a list of Parts inside a Message or an Artifact.
+Every content payload a client sends or a server returns is ultimately represented by Parts inside a Message or an Artifact.
 
 ---
 

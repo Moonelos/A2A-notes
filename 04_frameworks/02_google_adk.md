@@ -2,7 +2,7 @@
 
 > **Who this is for**: Engineers using or evaluating Google ADK who want to expose ADK agents over A2A and consume remote A2A agents. Before reading this, understand how an A2A server is structured: **[Building a Server](../03_python/02_building_a_server.md)**.
 
-ADK (`google-adk`) ships the deepest *native* A2A integration of any agent framework: a one-call `to_a2a()` wrapper that auto-generates an agent card, and a `RemoteA2aAgent` class that drops a remote agent into a multi-agent tree as if it were local. This file shows both directions and the `Event` ↔ `Task` mapping that makes it work.
+ADK (`google-adk`) offers a concise native A2A path: `to_a2a()` exposes an agent and `RemoteA2aAgent` consumes a peer without a handwritten SDK adapter. This is a claim about those two APIs' ergonomics, not a ranking of protocol coverage across frameworks.
 
 ---
 
@@ -207,33 +207,40 @@ prime_agent = RemoteA2aAgent(
 ### Auth and request shaping with `A2aRemoteAgentConfig`
 
 ```python
+import os
+
+from fastapi.openapi.models import HTTPBearer
+from google.adk.auth.auth_credential import (
+    AuthCredential,
+    AuthCredentialTypes,
+    HttpAuth,
+    HttpCredentials,
+)
 from google.adk.a2a.agent.config import A2aRemoteAgentConfig
 
-class BearerAuthInterceptor:
-    def __init__(self, token: str):
-        self._token = token
-
-    async def before_request(self, request):
-        request.headers["Authorization"] = f"Bearer {self._token}"
-        return request
-
-    async def after_request(self, response):
-        return response
+bearer_scheme = HTTPBearer(scheme="bearer")
+bearer_credential = AuthCredential(
+    auth_type=AuthCredentialTypes.HTTP,
+    http=HttpAuth(
+        scheme="bearer",
+        credentials=HttpCredentials(token=os.environ["PRIME_TOKEN"]),
+    ),
+)
 
 prime_agent = RemoteA2aAgent(
     name="prime_agent",
     description="Agent that checks whether numbers are prime.",
     agent_card=f"http://localhost:8001/a2a/check_prime_agent{AGENT_CARD_WELL_KNOWN_PATH}",
     use_legacy=False,
-    config=A2aRemoteAgentConfig(
-        request_interceptors=[BearerAuthInterceptor(token=os.environ["PRIME_TOKEN"])],
-        # also: a2a_message_converter, a2a_task_converter,
-        #       a2a_status_update_converter, a2a_artifact_update_converter
-    ),
+    auth_scheme=bearer_scheme,
+    auth_credential=bearer_credential,
+    config=A2aRemoteAgentConfig(),
 )
 ```
 
-❌ Do not assume `RemoteA2aAgent` reads ambient credentials. If the remote card advertises a `securitySchemes` entry, you must attach the credential yourself via a `request_interceptors` hook — there is no implicit token pickup.
+`RemoteA2aAgent` turns this credential into current card and request interceptors, so both card resolution and Message sends carry `Authorization: Bearer <redacted>`. A successful delegated turn reaches `TASK_STATE_COMPLETED`; `401` on either request means the credential or advertised scheme is wrong.
+
+❌ Do not substitute an object with `before_request(request)` that mutates `request.headers`. The current request hook receives `(InvocationContext, A2AMessage, ParametersConfig)` and returns `(message_or_event, parameters)`; it is not HTTP middleware. Prefer the supported `auth_scheme`/`auth_credential` path above.
 
 ---
 
@@ -356,7 +363,7 @@ remote agent runs ──> LongRunningFunctionTool returns "pending"
    Runner resumes the paused invocation with a function_response
 ```
 
-> **Key insight**: `input-required` is *not* an error. The A2A `Task` stays alive; the same `taskId` / `contextId` must be reused for the follow-up message, or the remote agent starts a fresh, stateless invocation and loses the pending tool call.
+`input-required` is not an error. The A2A Task stays alive; the follow-up reuses its Task identity and context so ADK can recover the pending tool call.
 
 ⚠️ ADK long-running tools rely on `EventActions.state_delta` to accumulate state across pauses. If a follow-up arrives on a new context, the delta history is gone and the resumed tool sees an empty session. Always thread `contextId` through the round-trip.
 

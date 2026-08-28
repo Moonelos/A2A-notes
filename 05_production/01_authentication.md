@@ -1,6 +1,6 @@
 # Authentication & Authorization for A2A in Production
 
-> **Who this is for**: Engineers hardening an A2A deployment who have already built a working server and client and now need to lock down who can call what. Targets A2A spec **v1.0.0** and `a2a-sdk` **1.0.x**.
+> **Who this is for**: Engineers hardening an A2A deployment who have already built a working server and client and now need to lock down who can call what. Targets wire protocol **1.0**, specification release **1.0.1**, and `a2a-sdk` **1.1.2**. Retest integrations before widening that SDK pin because request-handler lifecycle behavior is version-sensitive.
 
 Before reading this, understand how agents advertise themselves: **[The Agent Card](../02_protocol/01_agent_card.md)**, and how a request gets handled server-side: **[Building a Server](../03_python/02_building_a_server.md)**.
 
@@ -16,7 +16,7 @@ A2A is deliberately boring about security. It does **not** define its own token 
 ┌─────────────────────────────────────────────────────────┐
 │  HTTP request                                            │
 │  POST /a2a  HTTP/1.1                                      │
-│  Authorization: Bearer eyJhbGciOi...   ◄── auth lives HERE│
+│  Authorization: Bearer <access-token>  ◄── auth lives HERE│
 │  Content-Type: application/json                           │
 │  ┌─────────────────────────────────────────────────────┐ │
 │  │  JSON-RPC body  ◄── NO credentials here, ever        │ │
@@ -31,7 +31,7 @@ Three consequences follow, and they are non-negotiable:
 - ❌ A `client_secret`, bearer token, or API key embedded anywhere in the Agent Card or in a `Message` part is a **credential leak**. The card is public (it lives at a well-known URL).
 - ✅ The card carries only *metadata about how to authenticate* — endpoint URLs, scheme types, scope names.
 
-> **Key insight**: Treat the Agent Card like an OpenAPI document. It tells a client *how* to authenticate; acquiring the credential is the client's problem, solved with standard tooling.
+Think of the Agent Card like an OpenAPI document: it tells a client *how* to authenticate; acquiring the credential is the client's problem, solved with standard tooling.
 
 ---
 
@@ -40,7 +40,7 @@ Three consequences follow, and they are non-negotiable:
 The Agent Card has two top-level fields inspired by the OpenAPI `SecurityScheme` model but encoded as A2A protobuf/ProtoJSON objects:
 
 - `securitySchemes` — an object mapping a **scheme name** (you choose it) to a `SecurityScheme` definition.
-- `securityRequirements` — a list of **security requirement objects**. Each entry maps a scheme name to a list of required scopes. The list is an **OR**; satisfying any one entry authenticates the request.
+- `securityRequirements` — a list of **security requirement objects**. Entries in the list are alternatives (**OR**). Schemes inside one entry are cumulative (**AND**): all of them must be satisfied.
 
 ### Supported scheme types
 
@@ -49,10 +49,21 @@ The Agent Card has two top-level fields inspired by the OpenAPI `SecurityScheme`
 | `apiKeySecurityScheme` | `name`, `location` (`header` / `query` / `cookie`) | Simple internal services, low-trust |
 | `httpAuthSecurityScheme` | `scheme` (`Bearer` / `Basic`), `bearerFormat` | Opaque or JWT bearer tokens, basic auth |
 | `oauth2SecurityScheme` | `flows` (an `OAuthFlows` object) | Service-to-service & delegated user auth |
-| `openIdConnectSecurityScheme` | `openIdConnectUrl` | OAuth2 + identity, with OIDC discovery |
-| `mtlsSecurityScheme` | optional `description` only | Zero-trust enterprise mesh |
+| `openIdConnectSecurityScheme` | `openIdConnectUrl` | OAuth2 + identity, with OpenID Connect (OIDC) discovery |
+| `mtlsSecurityScheme` | optional `description` only | Mutual TLS (mTLS), where both peers present certificates |
 
-> **Rule**: An `OAuthFlows` object MUST contain **exactly one** of `authorizationCode`, `clientCredentials`, or `deviceCode` for new v1.0 cards. The old implicit and password flows are deprecated in v1.0.
+> **Rule**: An `OAuthFlows` object is a Protocol Buffers `oneof`: setting a second member overwrites the first in many generated APIs, and conforming parsers reject ambiguous JSON. Choose exactly one current flow: `authorizationCode`, `clientCredentials`, or `deviceCode`. The still-decodable `implicit` and `password` members are deprecated and should not appear in new cards.
+
+A requirement that demands both a client certificate and a scoped token uses one entry:
+
+```json
+{
+  "schemes": {
+    "mesh-mtls": { "list": [] },
+    "acme-sso": { "list": ["tasks:write"] }
+  }
+}
+```
 
 ### Example: declaring an OAuth2 client-credentials scheme
 
@@ -124,7 +135,7 @@ The client's job is three steps, and `a2a-sdk` automates the third one.
 
 ### The SDK mechanism: `AuthInterceptor` + `CredentialService`
 
-`a2a-sdk` 1.0.x exposes a `ClientCallInterceptor` hook. Interceptors run a `before()` method on every outbound call, which is exactly where headers get injected. The SDK ships a ready-made `AuthInterceptor` (in `a2a.client.auth.interceptor`) that pairs with a `CredentialService` (in `a2a.client.auth.credentials`).
+`a2a-sdk` 1.1.2 exposes a `ClientCallInterceptor` hook. Interceptors run a `before()` method on every outbound call. The shipped `AuthInterceptor` pairs with a `CredentialService`: it selects the first usable credential for Bearer, OAuth/OIDC, or a header API key. It skips query/cookie API keys and does not assemble compound AND requirements such as mTLS plus OAuth; configure those at the HTTP/gRPC client and application layer.
 
 `CredentialService` is an abstract base class with one method you must satisfy:
 
@@ -132,7 +143,8 @@ The client's job is three steps, and `a2a-sdk` automates the third one.
 async def get_credentials(
     security_scheme_name: str,
     context: ClientCallContext | None,
-) -> str | None
+) -> str | None:
+    ...
 ```
 
 The SDK provides `InMemoryContextCredentialStore`, a session-keyed implementation. You populate it; the `AuthInterceptor` reads from it and sets the right header based on the card's declared scheme.
@@ -186,7 +198,7 @@ async for event in client.send_message(request=request, context=context):
     handle(event)
 ```
 
-> **Key insight**: `InMemoryContextCredentialStore` keys credentials by the `sessionId` it reads from `ClientCallContext.state`. Forget to pass the context and `get_credentials` returns `None` — the request goes out **unauthenticated** and you get a 401 that looks like a server bug.
+`InMemoryContextCredentialStore` keys credentials by the `sessionId` it reads from `ClientCallContext.state`. Forget to pass the context and `get_credentials` returns `None`; fail closed before sending instead of relying on a later authentication error.
 
 ⚠️ For OAuth2, the token expires. Refresh it (or re-run the client-credentials grant) before expiry and call `set_credentials` again. The `InMemoryContextCredentialStore` does not refresh for you. For long-running clients, wrap a token cache around the fetch with a margin (e.g. refresh at 80% of `expires_in`).
 
@@ -194,7 +206,7 @@ async for event in client.send_message(request=request, context=context):
 
 ## 4. The Server Flow: Validate Before You Process
 
-The server MUST authenticate **every** incoming request before any business logic runs. The cleanest place is ASGI middleware, so a rejected request never reaches the agent executor.
+The server MUST authenticate **every** incoming request before any business logic runs. The cleanest place is ASGI (Asynchronous Server Gateway Interface) middleware, so a rejected request never reaches the agent executor.
 
 ```
 incoming request
@@ -211,17 +223,17 @@ incoming request
    AgentExecutor.execute(...)
 ```
 
-| Situation                                   | HTTP status | Notes                                       |
-| -------------------------------------------- | ----------- | ------------------------------------------- |
-| Missing or malformed credential              | `401`       | MUST include a `WWW-Authenticate` header    |
-| Valid credential, wrong/insufficient scope   | `403`       | Authenticated but not authorized            |
-| Valid credential, valid scope                | `200`       | Proceed to the JSON-RPC handler             |
+| Binding | Missing/invalid credential | Authenticated but forbidden |
+|---|---|---|
+| HTTP+JSON | HTTP `401` with `WWW-Authenticate` | HTTP `403` |
+| gRPC | `UNAUTHENTICATED` | `PERMISSION_DENIED` |
+| JSON-RPC over HTTP | The deployment may reject at HTTP with `401`/`403`, or return documented custom JSON-RPC errors after parsing | Same policy, consistently documented |
 
-> **Rule**: A `401`/`403` is an **HTTP transport-layer** rejection — return it as a plain HTTP response, *not* a JSON-RPC error object. The caller may not even have a valid JSON-RPC envelope yet.
+Authenticate before business logic regardless of binding. A gateway-level rejection is appropriate when the caller has not yet reached a valid protocol operation; binding-native errors are appropriate when authentication is integrated after transport parsing.
 
 ### The `auth-required` task state
 
-Sometimes the *caller* is authenticated fine, but the agent needs **additional** credentials mid-task — e.g. it must call a downstream SaaS API on the user's behalf. That is not a 401 on the A2A request itself. Instead the agent moves the `Task` into the **`auth-required`** state (`TASK_STATE_AUTH_REQUIRED`), an interrupted state. The task's status message tells the client what credential to supply; the client gathers it (often via an OAuth consent flow) and resumes the task.
+Sometimes the *caller* is authenticated fine, but the agent needs **additional** credentials mid-task — e.g. it must call a downstream SaaS API on the user's behalf. That is not a 401 on the A2A request itself. Instead the agent moves the `Task` into the **`auth-required`** state (`TASK_STATE_AUTH_REQUIRED`), an interrupted state. The status message explains what authorization is needed, but credentials MUST arrive out of band unless both peers negotiated an in-band extension. Once the external credential store is updated, the agent may resume immediately; a follow-up A2A `Message` is not required.
 
 ```
 auth-required  ≠  HTTP 401
@@ -238,11 +250,11 @@ auth-required   : "I know you; now I need a token to
 
 For service-to-service agent calls, the **client-credentials** grant is the right tool: no user is present, the calling agent *is* the principal. The flow has no redirect and no refresh-token dance — just `POST grant_type=client_credentials` to the `tokenUrl` and you get an access token.
 
-The server's job is to **validate the JWT** that arrives. Validation is four checks, and skipping any one is a real vulnerability:
+When the issuer promises a JWT access-token profile, the server validates that JSON Web Token (JWT). Do not infer JWT from OIDC alone: an OAuth access token can be opaque. Use issuer-supported local JWT validation or RFC 7662 token introspection according to the authorization server's metadata and contract.
 
 | Check       | What to verify                                              | If skipped                                  |
 | ----------- | ----------------------------------------------------------- | -------------------------------------------- |
-| `signature` | Verify against the issuer's public key (fetched via JWKS)   | Anyone can forge a token                    |
+| `signature` | Verify against the issuer's JSON Web Key Set (JWKS)        | Anyone can forge a token                    |
 | `iss`       | Matches your trusted issuer exactly                         | Tokens from any IdP are accepted            |
 | `aud`       | Matches *this* agent's identifier                           | **Token confusion** — see §8                |
 | `exp`       | Token is not expired (also `nbf` if present)                | Stolen tokens are valid forever             |
@@ -252,7 +264,7 @@ The server's job is to **validate the JWT** that arrives. Validation is four che
 This dependency validates an inbound JWT and returns the authenticated identity plus scopes. It fetches signing keys via JWKS with caching, so it does not hit the IdP on every request.
 
 ```python
-import time
+import logging
 from dataclasses import dataclass
 
 import jwt                                  # PyJWT
@@ -263,6 +275,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 ISSUER   = "https://sso.acme.internal/realms/agents"
 AUDIENCE = "invoice-processing-agent"        # THIS agent's identifier
 ALGS     = ["RS256"]
+logger = logging.getLogger(__name__)
 
 # PyJWKClient caches keys internally and refreshes on key rotation.
 _jwks = PyJWKClient(f"{ISSUER}/protocol/openid-connect/certs", cache_keys=True)
@@ -295,18 +308,22 @@ async def authenticated_principal(
             algorithms=ALGS,
             issuer=ISSUER,            # validates `iss`
             audience=AUDIENCE,        # validates `aud` — prevents token confusion
-            options={"require": ["exp", "iss", "aud"]},  # reject tokens missing them
+            options={"require": ["exp", "iss", "aud", "sub"]},
         )
     except jwt.PyJWTError as exc:
-        # Covers bad signature, expired (`exp`), wrong issuer/audience, etc.
+        # Do not reflect parser/key details or any token material to the caller.
+        logger.info("Bearer token rejected", extra={"reason_type": type(exc).__name__})
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid token: {exc}",
+            detail="Invalid bearer token",
             headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
         ) from exc
 
     scopes = frozenset(claims.get("scope", "").split())
-    return Principal(subject=claims["sub"], scopes=scopes)
+    subject = claims["sub"]
+    if not isinstance(subject, str) or not subject.strip():
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
+    return Principal(subject=subject, scopes=scopes)
 
 
 def require_scope(scope: str):
@@ -321,7 +338,7 @@ def require_scope(scope: str):
     return _gate
 ```
 
-Mount it so it guards the A2A RPC endpoint:
+Mount it so it guards the A2A endpoint, then carry the verified principal into the SDK-facing adapter:
 
 ```python
 @app.post("/invoice/a2a")
@@ -329,12 +346,15 @@ async def a2a_endpoint(
     request: Request,
     principal: Principal = Depends(require_scope("tasks:write")),
 ):
-    # `principal.subject` is the verified calling-agent identity — use it for
-    # per-agent authorization and audit logging (see §7).
-    return await a2a_request_handler.handle(request, principal=principal)
+    # This adapter is application code: it copies the principal into the
+    # ServerCallContext used by the handler/store. Never re-read an unverified header.
+    call_context = server_context_from_http(request, owner_id=principal.subject)
+    return await dispatch_a2a(request, a2a_request_handler, call_context)
 ```
 
-> **Key insight**: For `openIdConnect` schemes the only practical difference is discovery — fetch `openIdConnectUrl` (the `/.well-known/openid-configuration`) once to learn `jwks_uri`, `issuer`, and `token_endpoint` instead of hardcoding them. Validation logic is identical.
+`server_context_from_http` and `dispatch_a2a` are deliberate application-boundary functions, not SDK helpers: their contract is to preserve the already-verified `owner_id` through every task-store and executor call.
+
+OIDC discovery supplies issuer metadata such as `jwks_uri` and `token_endpoint`; it does not dictate access-token format. Validate JWT access tokens only when the issuer documents that profile. Otherwise call the issuer's authenticated introspection endpoint and enforce `active`, issuer/audience/resource, subject, expiry, and scopes.
 
 ---
 
@@ -343,12 +363,14 @@ async def a2a_endpoint(
 In a zero-trust mesh, bearer tokens are still bearer tokens — steal one and you are in. **Mutual TLS** binds the connection itself to a verified client certificate, so a leaked token alone is not enough. Declare it in the card with the `mtlsSecurityScheme` oneof:
 
 ```json
+{
 "securitySchemes": {
   "mesh-mtls": {
     "mtlsSecurityScheme": {
       "description": "Caller must present a cert from the Acme internal CA"
     }
   }
+}
 }
 ```
 
@@ -368,7 +390,7 @@ uvicorn.run(
 )
 ```
 
-✅ Combine mTLS with OAuth2: mTLS proves *which machine* connected; the JWT proves *which scopes* it carries. Defense in depth — this is the recommended posture for cross-team or cross-org A2A.
+✅ Combine mTLS with OAuth2 when both are declared in one security-requirement entry: mTLS proves which workload connected; the access token carries the delegated identity and scopes.
 
 ⚠️ `ssl.CERT_OPTIONAL` accepts connections with **no** client cert at all. Always use `CERT_REQUIRED` when mTLS is the security boundary.
 
@@ -378,23 +400,43 @@ uvicorn.run(
 
 Authentication answers *who*. **Authorization** answers *what may they do* — and A2A pushes this entirely onto your application.
 
-- **Scope skills and tasks per caller.** The card advertises skills; map each skill (or RPC method) to a required scope. A caller with `tasks:read` can poll status but cannot call `SendMessage` for a `submit-invoice` task — that needs `tasks:write`.
+- **Scope operations and resources per caller.** A caller with `tasks:read` may inspect only tasks it owns; `tasks:write` does not grant access to another tenant's task.
 - **Per-agent identity.** The JWT `sub` (or the mTLS cert subject) is a stable identity for the *calling agent*. Use it for allow-lists ("only the `procurement-agent` may submit invoices over $50k"), rate limiting, and audit trails.
 - **Least privilege.** Issue each agent its own OAuth client with the minimum scope set. Never share one client across a fleet — you lose per-agent attribution and blast-radius control.
 
 ```python
-# Skill-level authorization, keyed off the skill id in the inbound request.
+# Skill routing is application policy: core Message has no invoked-skill field.
+# This service negotiated and validates `urn:acme:routing:v1`, whose DataPart
+# carries {"skillId": "..."}. Reject missing/unknown extension payloads.
 SKILL_SCOPE = {
     "submit-invoice": "tasks:write",
     "invoice-status": "tasks:read",
 }
 
-def authorize_skill(skill_id: str, principal: Principal) -> None:
+def authorize_skill(validated_routing_part: dict, principal: Principal) -> None:
+    skill_id = validated_routing_part["skillId"]
     needed = SKILL_SCOPE.get(skill_id)
-    if needed and needed not in principal.scopes:
+    if needed is None or needed not in principal.scopes:
         raise HTTPException(status.HTTP_403_FORBIDDEN,
-                            detail=f"Skill '{skill_id}' requires scope '{needed}'")
+                            detail="Operation is not permitted")
 ```
+
+Resource ownership is mandatory even after scope checks. Resolve the owner from the verified principal, never from request data:
+
+```python
+async def get_owned_task(task_id: str, principal: Principal) -> Task:
+    task = await tasks.get_by_owner(owner_id=principal.subject, task_id=task_id)
+    if task is None:
+        # Same response for absent and inaccessible IDs: do not disclose existence.
+        raise TaskNotFound()
+    return task
+
+# Apply the same owner/tenant predicate before:
+# GetTask, ListTasks, CancelTask, SubscribeToTask,
+# Get/List/DeleteTaskPushNotificationConfig, and every update/delete.
+```
+
+Attack trace: `agent-a` has a valid `tasks:read` token and guesses `agent-b`'s task ID. The scope check passes, but `get_by_owner("agent-a", guessed_id)` returns no row, so the response is indistinguishable from an unknown ID and no status, artifact, history, subscription, or push target leaks.
 
 > **Principle**: Authentication is a gate at the door; authorization is a guard at every room. A2A gives you the gate (HTTP + OpenAPI schemes); the guards are yours to build.
 
@@ -429,7 +471,7 @@ Each of these has shipped to production somewhere. Audit your deployment against
 | **Bearer 401 without `WWW-Authenticate`** | Spec violation; well-behaved clients cannot discover how to retry | Always set the `WWW-Authenticate` header on a 401 |
 | **One OAuth client shared across the fleet** | All agents share an identity — no per-agent allow-listing, no audit attribution, huge blast radius on leak | One OAuth client (and minimal scope set) per agent |
 
-> **Key insight**: The single most common A2A auth bug is **mismatched coverage** — the public card path is locked down while the RPC endpoint is open, or vice versa. The well-known card path *should* be public; the RPC endpoint *must* be guarded. Verify both explicitly.
+> **Key insight**: Authentication establishes a principal; it does not authorize a resource. Carry the verified owner/tenant identity into every task and push-configuration query, including reads and subscriptions, and return the same not-found result for missing and inaccessible IDs.
 
 ---
 

@@ -2,7 +2,7 @@
 
 > The conceptual foundation: what the A2A protocol is, the vocabulary it defines, and where it sits relative to MCP.
 
-[![A2A](https://img.shields.io/badge/A2A-spec_1.0.0-4285F4.svg)](https://a2a-protocol.org/latest/specification/)
+[![A2A](https://img.shields.io/badge/A2A-wire_1.0_%7C_spec_1.0.1-4285F4.svg)](https://a2a-protocol.org/latest/specification/)
 
 ---
 

@@ -2,7 +2,7 @@
 
 > **Who this is for**: Engineers modelling long-running agent work over A2A — anyone who needs to know when a job is *done*, when it's *waiting on you*, and when it's safe to stop polling. Before reading this, understand how A2A messages move on the wire: **[Transport & RPC](02_transport_and_rpc.md)**.
 
-A **Task** is A2A's unit of stateful, potentially long-running work. Unlike a one-shot Message exchange, a Task has an identity (`id`), a lifecycle, and a status that evolves over time. This note covers the `TaskState` enum, the legal transitions between states, and the failure modes that bite clients who model the lifecycle wrong.
+A **Task** is A2A's unit of stateful, potentially long-running work. Unlike a one-shot Message exchange, a Task has an identity (`id`), a lifecycle, and a status that evolves over time. This note targets protocol **1.0**, checked against specification release **1.0.1**.
 
 ---
 
@@ -19,8 +19,8 @@ Not every A2A interaction produces a Task. When a client sends `SendMessage`, th
               │                         │
               ▼                         ▼
    Returns a Message            Returns a Task
-   (final answer inline,        (has id, contextId, status;
-    no id, no lifecycle)         client tracks it over time)
+   (has messageId, but          (has id, contextId, status;
+    no taskId/lifecycle)         client tracks it over time)
 ```
 
 - A **Message** result is terminal by construction. There is nothing to poll, nothing to cancel. The agent answered and moved on.
@@ -52,7 +52,7 @@ Not every A2A interaction produces a Task. When a client sends `SendMessage`, th
 
 The two **interrupted** states — `TASK_STATE_INPUT_REQUIRED` and `TASK_STATE_AUTH_REQUIRED` — are *not* terminal. The Task is paused, waiting on the *client*. The agent will resume once the client supplies what is missing.
 
-> **Key insight**: There are three buckets, not two. Active (`SUBMITTED`, `WORKING`), Interrupted (`INPUT_REQUIRED`, `AUTH_REQUIRED`), and Terminal. A client that only distinguishes "done vs. not done" will mishandle the interrupted bucket.
+There are three buckets, not two: Active (`SUBMITTED`, `WORKING`), Interrupted (`INPUT_REQUIRED`, `AUTH_REQUIRED`), and Terminal. A client that only distinguishes "done vs. not done" will mishandle the interrupted bucket.
 
 ---
 
@@ -84,7 +84,7 @@ Valid transitions for a Task (shown with friendly labels; the wire values are th
                         │ completed │ │ failed │ │ canceled │
                         └───────────┘ └────────┘ └──────────┘
 
-   rejected ◄── agent declines at intake (from submitted, before work begins)
+   rejected ◄── agent declines initially or later when it cannot or will not proceed
 
    CancelTask can drive working / input-required / auth-required ──► canceled
 ```
@@ -95,7 +95,7 @@ Reading the diagram:
 - `working → completed | failed` — the normal happy/sad endings.
 - `working → input-required → working` — the agent pauses, the client answers, work resumes. This loop can repeat any number of times.
 - `working → auth-required → working` — same loop, but the missing thing is credentials.
-- `submitted → rejected` — the agent refuses the task before doing any work.
+- `submitted | working | interrupted → rejected` — the agent may refuse initially or later after determining that it cannot or will not proceed.
 - Any non-terminal state `→ canceled` — a `CancelTask` call (subject to a race; see §8).
 
 > **Rule**: A terminal state has *no outgoing edges*. There is no `completed → working`. If you need to "continue" finished work, that is a **new Task** (optionally linked via `referenceTaskIds` — see §7).
@@ -134,7 +134,10 @@ A Task paused for input — note the `message` carries the agent's question:
   "status": {
     "state": "TASK_STATE_INPUT_REQUIRED",
     "message": {
+      "messageId": "msg-status-input-1",
       "role": "ROLE_AGENT",
+      "taskId": "task-7f3a9c21",
+      "contextId": "ctx-4b8e",
       "parts": [
         { "text": "Which date range should the report cover?" }
       ]
@@ -153,7 +156,10 @@ A failed Task — the `message` should explain *why*:
   "status": {
     "state": "TASK_STATE_FAILED",
     "message": {
+      "messageId": "msg-status-failed-1",
       "role": "ROLE_AGENT",
+      "taskId": "task-7f3a9c21",
+      "contextId": "ctx-4b8e",
       "parts": [
         { "text": "Upstream data source returned 503 after 3 retries." }
       ]
@@ -186,9 +192,9 @@ The resume flow:
 6. ... eventually → `TASK_STATE_COMPLETED`
 ```
 
-The critical detail is step 4: the follow-up Message must reference the **existing** `taskId` and `contextId`. That is what distinguishes "continuing a paused task" from "starting a brand-new task."
+The critical detail is step 4: the follow-up Message must reference the existing `taskId`. `contextId` may be omitted when `taskId` is present; the server then infers it. If the client supplies both, they must match the existing Task or the server rejects the request.
 
-> **Rule**: To answer an `input-required` Task, send a new Message with the original `taskId` and `contextId`. Omitting `taskId` starts a fresh, unrelated Task — the agent never gets your answer.
+> **Rule**: To answer an `input-required` Task, send a new Message with the original `taskId`; also preserve `contextId` when your client carries it. Omitting `taskId` starts new work. Supplying a mismatched `taskId`/`contextId` pair is an error, not a new conversation.
 
 ✅ Correct — the answer routes back to the waiting Task:
 
@@ -197,6 +203,7 @@ The critical detail is step 4: the follow-up Message must reference the **existi
   "method": "SendMessage",
   "params": {
     "message": {
+      "messageId": "msg-input-answer-1",
       "role": "ROLE_USER",
       "taskId": "task-7f3a9c21",
       "contextId": "ctx-4b8e",
@@ -224,9 +231,10 @@ The client's job:
 
 1. Read `status.message` to learn *which* credential or scheme is required.
 2. Acquire it — typically an out-of-band OAuth flow, token refresh, or secret lookup.
-3. Resume the Task by sending a Message with the matching `taskId`/`contextId`, supplying the credential via the channel the agent specified (often a transport-level `Authorization` header rather than message content).
+3. Deliver the credential through that external OAuth, secret broker, or other negotiated out-of-band channel. Core A2A does not carry the downstream credential in a Message or repurpose the A2A `Authorization` header for it.
+4. Observe the same Task resume through its existing stream, push notifications, or `GetTask` polling. The agent may resume immediately after receiving the credential; a follow-up Message is not required unless the application separately needs one.
 
-> **Rule**: Treat `auth-required` exactly like `input-required` for lifecycle purposes — non-terminal, resumed by reusing `taskId`/`contextId`. The only difference is *what* you must provide.
+> **Rule**: Treat `auth-required` as non-terminal, but do not copy the input-required resume carrier. Credentials remain out of band unless a specific in-band authorization extension was negotiated.
 
 ⚠️ Never put long-lived secrets in a message `part`. Credentials belong in transport headers or the agent's declared auth scheme. The `auth-required` state tells you authentication is needed; it does not invite you to paste a token into chat text.
 
@@ -237,7 +245,7 @@ The client's job:
 For non-streaming clients, the lifecycle is observed by **polling**:
 
 - **`GetTask`** — fetch the current `Task` (and thus its `status.state`). Poll on a backoff until `state` is terminal, then stop. `GetTask` is a pure read and fully **idempotent** — calling it ten times changes nothing.
-- **`CancelTask`** — request that the agent stop a non-terminal Task. On success the Task moves to `TASK_STATE_CANCELED`. Cancelling an *already-terminal* Task is a no-op or an error — it cannot resurrect or alter finished work.
+- **`CancelTask`** — request that the agent stop a non-terminal Task. On success the Task moves to `TASK_STATE_CANCELED`. Calling it for a completed, failed, canceled, or rejected Task returns `TaskNotCancelableError`; it cannot resurrect or alter finished work.
 
 > **Rule**: Poll `GetTask` with exponential backoff, not a tight loop. The terminal states (`COMPLETED`/`FAILED`/`CANCELED`/`REJECTED`) are your *only* stop condition — `INPUT_REQUIRED` and `AUTH_REQUIRED` mean "keep the Task open and act," not "stop."
 
@@ -247,6 +255,7 @@ For non-streaming clients, the lifecycle is observed by **polling**:
 
 ```json
 {
+  "messageId": "msg-q2-report-1",
   "role": "ROLE_USER",
   "contextId": "ctx-4b8e",
   "referenceTaskIds": ["task-7f3a9c21"],
@@ -268,7 +277,7 @@ The lifecycle is small, but clients break it in predictable ways.
 
 ❌ **Not handling `input-required` (or `auth-required`) at all.** The client polls until it sees something "not working," gives up, and the paused Task expires server-side. *Fix*: when you see an interrupted state, read `status.message` and send a continuation Message.
 
-❌ **Losing the `contextId`.** The client answers an `input-required` Task but generates a fresh `contextId` (or drops it). The agent treats the reply as an unrelated new conversation and loses all prior context — the report it asked you to scope is gone. *Fix*: persist `contextId` (and `taskId`) alongside any pending Task; echo them back verbatim.
+❌ **Supplying a mismatched `contextId`.** A continuation with `taskId: "task-7f3a9c21"` and a different context must be rejected. Omitting `contextId` is valid when `taskId` is present because the server infers it. *Fix*: persist both when practical, but never invent or replace the context on a continuation.
 
 ❌ **Races on cancel.** The client calls `CancelTask`, assumes the Task is `TASK_STATE_CANCELED`, and stops — but the agent had *already* reached `TASK_STATE_COMPLETED` microseconds earlier. Cancel is a *request*, not a command; the agent may have finished or failed first. *Fix*: after `CancelTask`, do one more `GetTask` and trust the *actual* returned state. The Task may legitimately end up `TASK_STATE_COMPLETED` or `TASK_STATE_FAILED` instead of `TASK_STATE_CANCELED`.
 

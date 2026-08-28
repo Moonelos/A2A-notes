@@ -1,10 +1,59 @@
 # Building an A2A Client with `a2a-sdk`
 
-> **Who this is for**: Python engineers who have built or read about an A2A server and now need to *call* one. You know `async`/`await` and `httpx`. By the end you can discover a remote agent, send it work, stream results, resume an `input-required` pause, and attach credentials — all against `a2a-sdk==1.0.3`.
+<!-- length-justification: This implementation note keeps discovery, transport selection, send/stream recovery, authentication, and cleanup in one client lifecycle so identity captured in one stage is visible in the next. -->
+
+> **Who this is for**: Python engineers who have built or read about an A2A server and now need to *call* one. You know `async`/`await` and `httpx`. By the end you can discover a remote agent, send it work, stream results, resume an `input-required` pause, and attach credentials — all against `a2a-sdk==1.1.2`.
 
 Before reading this, understand the server side: **[Building a Server](02_building_a_server.md)**. The streaming event model is covered in **[Streaming & Push](../02_protocol/04_streaming_and_push.md)**.
 
-> **Rule**: Everything here targets `a2a-sdk` **`1.0.x`**. The `1.0` line moved the wire model onto **protocol-buffer types** (`a2a.types` re-exports them from `a2a.types.a2a_pb2`). That means `oneof` fields, `HasField()`, enum constants like `Role.ROLE_USER`, and `Struct`/`Value` for free-form data. Pre-`1.0` tutorials using `A2AClient`, `SendMessageRequest(params=...)`, or `Message(role="user")` will **not** import or run here.
+> **Rule**: Everything here targets `a2a-sdk` **`1.1.2`**. The wire model uses Protocol Buffers types. A protobuf **`oneof`** is a group in which exactly one field may be active, so response code uses `HasField()` before reading `message`, `task`, `status_update`, or `artifact_update`. **gRPC** is A2A's typed remote-procedure-call binding over HTTP/2; **Server-Sent Events (SSE)** is the HTTP stream used by JSON-RPC and HTTP+JSON.
+
+## Quick start: discover, create, send, interpret
+
+Start the echo server from [Building a Server](02_building_a_server.md), then save this as `echo_client.py`:
+
+```python
+import asyncio
+from uuid import uuid4
+
+import httpx
+
+from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
+from a2a.types import Message, Part, Role, SendMessageRequest, TaskState
+from a2a.utils import TransportProtocol
+
+
+async def main() -> None:
+    async with httpx.AsyncClient(timeout=10.0) as http:
+        card = await A2ACardResolver(
+            httpx_client=http, base_url="http://127.0.0.1:9999"
+        ).get_agent_card()
+        client = ClientFactory(ClientConfig(
+            httpx_client=http,
+            supported_protocol_bindings=[TransportProtocol.JSONRPC],
+        )).create(card)
+
+        request = SendMessageRequest(message=Message(
+            message_id=f"msg-{uuid4()}",
+            role=Role.ROLE_USER,
+            parts=[Part(text="hello")],
+        ))
+        async with client:
+            async for event in client.send_message(request=request):
+                if event.HasField("message"):
+                    print("reply:", event.message.parts[0].text)
+                elif event.HasField("task"):
+                    print("task:", TaskState.Name(event.task.status.state))
+                    for artifact in event.task.artifacts:
+                        print("artifact:", artifact.parts[0].text)
+
+
+asyncio.run(main())
+```
+
+Run `python echo_client.py`. The baseline server produces `task: TASK_STATE_COMPLETED` and `artifact: echo: hello`. A card-resolution error means the server or well-known route is unavailable; `no compatible transports found` means the card and `ClientConfig` share no binding.
+
+> **Production:** this baseline is deliberately local and unauthenticated. Streaming recovery, secure gRPC, credentials, timeouts, and bounded retries follow after the working round trip.
 
 ---
 
@@ -48,7 +97,7 @@ from a2a.client import (
 )
 ```
 
-> **Key insight**: The `Client` is **transport-agnostic by construction**. The same `client.send_message(...)` call runs over JSON-RPC, REST (`HTTP+JSON`), or gRPC depending only on what the card advertises and what your `ClientConfig` allows. Write your logic once.
+The `Client` is transport-agnostic by construction. The same `send_message` call runs over JSON-RPC, HTTP+JSON, or gRPC according to the card and `ClientConfig`.
 
 ---
 
@@ -143,7 +192,21 @@ from a2a.client import create_client
 client = await create_client("https://agent.example.com", client_config=config)
 ```
 
-⚠️ gRPC needs more: install `a2a-sdk[grpc]` and set `config.grpc_channel_factory` (e.g. `grpc.aio.insecure_channel`). Without it, requesting `TransportProtocol.GRPC` raises `ImportError` at factory construction.
+⚠️ gRPC needs more: install `a2a-sdk[grpc]` and provide a channel factory with trusted Transport Layer Security (TLS) roots. Plaintext `grpc.aio.insecure_channel` is not a production default.
+
+```python
+from pathlib import Path
+
+import grpc
+
+trusted_roots = Path("/etc/my-agent/trusted-ca.pem").read_bytes()
+credentials = grpc.ssl_channel_credentials(root_certificates=trusted_roots)
+config.grpc_channel_factory = lambda target: grpc.aio.secure_channel(
+    target, credentials
+)
+```
+
+Success is a completed TLS handshake to the hostname from the selected card interface. `CERTIFICATE_VERIFY_FAILED` means the configured roots or hostname do not match; do not bypass verification to make it connect.
 
 ---
 
@@ -215,23 +278,31 @@ async for event in client.send_message(request=request):
 When the agent advertises `capabilities.streaming` and your `ClientConfig.streaming=True`, `send_message()` yields events live as the agent produces them. You consume the same `StreamResponse` `oneof`, plus the two update events.
 
 ```python
+from dataclasses import dataclass
+
 from a2a.types import TaskState
 
-async def run_streaming(client, request):
-    task_id = context_id = None
+
+@dataclass
+class StreamProgress:
+    task_id: str = ""
+    context_id: str = ""
+
+
+async def run_streaming(client, request, progress: StreamProgress):
 
     async for event in client.send_message(request=request):
         if event.HasField("task"):
             # Initial snapshot — usually the first event of a long task.
-            task_id = event.task.id
-            context_id = event.task.context_id
+            progress.task_id = event.task.id
+            progress.context_id = event.task.context_id
 
         elif event.HasField("status_update"):
             upd = event.status_update          # TaskStatusUpdateEvent
-            task_id, context_id = upd.task_id, upd.context_id
+            progress.task_id, progress.context_id = upd.task_id, upd.context_id
             print(f"state -> {TaskState.Name(upd.status.state)}")
             if upd.status.state == TaskState.TASK_STATE_INPUT_REQUIRED:
-                return ("needs_input", task_id, context_id)
+                return "needs_input"
 
         elif event.HasField("artifact_update"):
             upd = event.artifact_update        # TaskArtifactUpdateEvent
@@ -243,7 +314,7 @@ async def run_streaming(client, request):
         elif event.HasField("message"):
             print("inline reply:", event.message.parts[0].text)
 
-    return ("done", task_id, context_id)
+    return "done"
 ```
 
 A typical long-task stream:
@@ -257,7 +328,7 @@ artifact_update (append=True, last_chunk=True)
 status_update   (TASK_STATE_COMPLETED)    ← terminal
 ```
 
-> **Key insight**: `artifact_update.append` and `last_chunk` are the chunking protocol. `append=False` starts a new artifact; `append=True` extends the previous one; `last_chunk=True` closes it. Buffer per `artifact.artifact_id`, or you will interleave chunks from two artifacts streamed in parallel.
+`artifact_update.append` and `last_chunk` are the chunking protocol. Buffer per `artifact.artifact_id` or parallel artifacts will interleave.
 
 ⚠️ **Connection drops mid-stream.** A long SSE connection *will* be cut by a proxy idle timeout or a network blip. The `async for` then raises `httpx.ReadError` / `httpx.RemoteProtocolError` — it does **not** end cleanly. Catch it and **resume** with `subscribe()` using the `task_id` you captured, rather than re-sending the message (which would start a *new* task):
 
@@ -265,15 +336,18 @@ status_update   (TASK_STATE_COMPLETED)    ← terminal
 import httpx
 from a2a.types import SubscribeToTaskRequest
 
+progress = StreamProgress()  # caller-owned: survives an exception inside the drain
 try:
-    status, task_id, context_id = await run_streaming(client, request)
+    status = await run_streaming(client, request, progress)
 except (httpx.ReadError, httpx.RemoteProtocolError):
-    if task_id:                                  # we got far enough to know the id
+    if progress.task_id:                         # identity was captured before the drop
         async for event in client.subscribe(
-            request=SubscribeToTaskRequest(id=task_id)
+            request=SubscribeToTaskRequest(id=progress.task_id)
         ):
             ...  # same StreamResponse handling as above
 ```
+
+If the connection fails before any Task or status event populates `progress.task_id`, there is no safe subscription target. Do not resend unless the server documents durable deduplication for the original `messageId`; surface the indeterminate outcome instead.
 
 ---
 
@@ -344,6 +418,8 @@ Outgoing calls are authenticated with **interceptors**. `AuthInterceptor` reads 
 It pulls the secret from a `CredentialService` you implement. `InMemoryContextCredentialStore` is the built-in, session-keyed implementation:
 
 ```python
+import os
+
 from a2a.client import (
     ClientFactory, AuthInterceptor, InMemoryContextCredentialStore, ClientCallContext,
 )
@@ -353,7 +429,7 @@ store = InMemoryContextCredentialStore()
 await store.set_credentials(
     session_id="session-abc",
     security_scheme_name="bearerAuth",        # MUST match a key in card.security_schemes
-    credential="eyJhbGciOi...",               # the raw token; AuthInterceptor prefixes "Bearer "
+    credential=os.environ["A2A_BEARER_TOKEN"], # raw token; never log or hard-code it
 )
 
 # 2. Build the client with the interceptor wired in.
@@ -365,22 +441,43 @@ async for event in client.send_message(request=request, context=ctx):
     ...
 ```
 
-For a static service token, a one-line custom `CredentialService` is cleaner than the session store:
+For service credentials, map each advertised scheme name to its own secret and fail closed when no credential was configured:
 
 ```python
+import os
+
 from a2a.client import CredentialService
 
-class StaticTokenService(CredentialService):
-    def __init__(self, token: str):
-        self._token = token
+class SchemeCredentialService(CredentialService):
+    def __init__(self, credentials: dict[str, str]):
+        self._credentials = credentials
 
     async def get_credentials(self, security_scheme_name, context):
-        return self._token        # same secret for every scheme / every call
+        try:
+            return self._credentials[security_scheme_name]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"No credential configured for scheme {security_scheme_name!r}"
+            ) from exc
 
-client = factory.create(card, interceptors=[AuthInterceptor(StaticTokenService(API_TOKEN))])
+credentials = SchemeCredentialService({
+    "bearerAuth": os.environ["A2A_BEARER_TOKEN"],
+    "partnerKey": os.environ["A2A_PARTNER_API_KEY"],
+})
+client = factory.create(card, interceptors=[AuthInterceptor(credentials)])
 ```
 
-> **Key insight**: `AuthInterceptor` is a **no-op when the card declares no security schemes**. If your authenticated calls come back `401`, check the *card* first — a missing or wrong `security_schemes` entry means the interceptor silently skips, attaching nothing.
+The stock `AuthInterceptor` uses the first usable scheme, supports Bearer/OAuth/OpenID Connect and header API keys, and does not assemble every scheme in a compound AND requirement. For a requirement containing both `mtls` and `bearerAuth`, preflight the card and either configure the TLS client certificate plus Bearer header in a custom interceptor or reject that interface before sending:
+
+```text
+card requirement:  mtls AND bearerAuth
+configured call:   client certificate + Authorization: Bearer <access-token>  -> send
+missing mTLS cert:  Authorization header only                                -> reject locally
+```
+
+A `401` or `403` despite one attached credential is the tell that the server required the full compound set.
+
+`AuthInterceptor` is a no-op when the card declares no security schemes. If authenticated calls return `401`, inspect the card and the exact scheme-name mapping first.
 
 For OAuth2 client-credentials flows, token caching, and per-scope tokens, see **[Authentication](../05_production/01_authentication.md)**.
 
@@ -393,6 +490,8 @@ Discover an agent, send a streaming task, handle an `input-required` pause, and 
 ```python
 """a2a_client_demo.py — discover, send, stream, resume an A2A task."""
 import asyncio
+from dataclasses import dataclass
+import os
 from uuid import uuid4
 
 import httpx
@@ -408,7 +507,6 @@ from a2a.types import (
 from a2a.utils import TransportProtocol
 
 AGENT_URL = "https://agent.example.com"
-API_TOKEN = "eyJhbGciOi..."
 
 TERMINAL = {
     TaskState.TASK_STATE_COMPLETED, TaskState.TASK_STATE_FAILED,
@@ -416,12 +514,20 @@ TERMINAL = {
 }
 
 
-class StaticTokenService(CredentialService):
-    def __init__(self, token: str):
-        self._token = token
+class SchemeCredentialService(CredentialService):
+    def __init__(self, credentials: dict[str, str]):
+        self._credentials = credentials
 
     async def get_credentials(self, security_scheme_name, context):
-        return self._token
+        if security_scheme_name not in self._credentials:
+            raise RuntimeError(f"No credential for {security_scheme_name!r}")
+        return self._credentials[security_scheme_name]
+
+
+@dataclass
+class StreamProgress:
+    task_id: str = ""
+    context_id: str = ""
 
 
 def user_message(text: str, *, task_id: str = "", context_id: str = "") -> SendMessageRequest:
@@ -437,22 +543,22 @@ def user_message(text: str, *, task_id: str = "", context_id: str = "") -> SendM
     )
 
 
-async def drain_stream(stream) -> tuple[str, str, str]:
-    """Consume an event stream. Returns (outcome, task_id, context_id)."""
-    task_id = context_id = ""
+async def drain_stream(stream, progress: StreamProgress) -> str:
+    """Consume an event stream while exposing captured identity to the caller."""
     async for event in stream:
         if event.HasField("task"):
-            task_id, context_id = event.task.id, event.task.context_id
+            progress.task_id = event.task.id
+            progress.context_id = event.task.context_id
 
         elif event.HasField("status_update"):
             upd = event.status_update
-            task_id, context_id = upd.task_id, upd.context_id
+            progress.task_id, progress.context_id = upd.task_id, upd.context_id
             state = upd.status.state
             print(f"  [status] {TaskState.Name(state)}")
             if state == TaskState.TASK_STATE_INPUT_REQUIRED:
-                return "needs_input", task_id, context_id
+                return "needs_input"
             if state in TERMINAL:
-                return "done", task_id, context_id
+                return "done"
 
         elif event.HasField("artifact_update"):
             for part in event.artifact_update.artifact.parts:
@@ -461,9 +567,9 @@ async def drain_stream(stream) -> tuple[str, str, str]:
 
         elif event.HasField("message"):
             print(f"  [reply] {event.message.parts[0].text}")
-            return "done", task_id, context_id
+            return "done"
 
-    return "stream_ended", task_id, context_id
+    return "stream_ended"
 
 
 async def resolve_with_retry(resolver: A2ACardResolver, attempts: int = 3):
@@ -496,37 +602,42 @@ async def main() -> None:
             ],
         )
         factory = ClientFactory(config)
-        client = factory.create(
-            card, interceptors=[AuthInterceptor(StaticTokenService(API_TOKEN))],
-        )
+        credential_service = SchemeCredentialService({
+            "bearerAuth": os.environ["A2A_BEARER_TOKEN"],
+        })
+        client = factory.create(card, interceptors=[AuthInterceptor(credential_service)])
 
         async with client:                          # closes transport on exit
             # 3. Send the initial task and stream its events.
             print("Sending task...")
+            progress = StreamProgress()
             try:
-                outcome, task_id, context_id = await drain_stream(
+                outcome = await drain_stream(
                     client.send_message(request=user_message(
                         "Generate a Q3 revenue report for the EMEA region."
-                    ))
+                    )), progress
                 )
             except (httpx.ReadError, httpx.RemoteProtocolError) as e:
                 # 3b. Connection dropped mid-stream — resume, don't re-send.
-                print(f"stream dropped ({e}); resubscribing to {task_id}")
-                outcome, task_id, context_id = await drain_stream(
-                    client.subscribe(request=SubscribeToTaskRequest(id=task_id))
+                if not progress.task_id:
+                    raise RuntimeError("stream outcome unknown; no task id captured") from e
+                print(f"stream dropped ({e}); resubscribing to {progress.task_id}")
+                outcome = await drain_stream(
+                    client.subscribe(request=SubscribeToTaskRequest(id=progress.task_id)),
+                    progress,
                 )
 
             # 4. Handle an input-required pause with a follow-up on the SAME ids.
             if outcome == "needs_input":
-                print(f"Agent needs input on task {task_id}")
-                outcome, task_id, context_id = await drain_stream(
+                print(f"Agent needs input on task {progress.task_id}")
+                outcome = await drain_stream(
                     client.send_message(request=user_message(
                         "Use calendar quarters; revenue in EUR.",
-                        task_id=task_id, context_id=context_id,
-                    ))
+                        task_id=progress.task_id, context_id=progress.context_id,
+                    )), progress
                 )
 
-            print(f"Final outcome: {outcome} (task {task_id or 'n/a'})")
+            print(f"Final outcome: {outcome} (task {progress.task_id or 'n/a'})")
 
 
 if __name__ == "__main__":

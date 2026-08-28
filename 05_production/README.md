@@ -14,14 +14,17 @@
 | [01_authentication.md](01_authentication.md) | Authentication | Declaring and enforcing API key, OAuth2, OIDC, and mTLS auth between agents |
 | [02_security_hardening.md](02_security_hardening.md) | Security | Agent Card signing, input validation, the A2A threat model, defensive patterns |
 | [03_scaling_deployment.md](03_scaling_deployment.md) | Scale & ops | Stateless servers, shared task stores, push infrastructure, observability |
+| [04_multi_tenant_scoping.md](04_multi_tenant_scoping.md) | Isolation | Verified tenant routing and owner-scoped resources, jobs, events, and push configs |
+| [05_conformance_and_interoperability.md](05_conformance_and_interoperability.md) | Release proof | Inspector/TCK and cross-binding contract tests |
 
 ---
 
 ## Reading Order
 
-1. **Authentication** — never expose an unauthenticated agent endpoint
-2. **Security Hardening** — defend against the documented threat model
-3. **Scaling & Deployment** — run multiple replicas with shared state
+1. **Authentication** — establish and carry a verified principal
+2. **Security Hardening** + **Multi-Tenant Scoping** — secure single-replica milestone
+3. **Scaling & Deployment** — continue for replicas, durable jobs, or operational reliability
+4. **Conformance & Interoperability** — release gate the deployed Agent Card and all advertised bindings
 
 ---
 

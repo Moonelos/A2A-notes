@@ -2,8 +2,8 @@
 
 > A practical, implementation-focused guide to the Agent2Agent (A2A) protocol — from core concepts to production-grade multi-agent systems.
 
-[![A2A](https://img.shields.io/badge/A2A-spec_1.0.0-4285F4.svg?logo=googlecloud&logoColor=white)](https://a2a-protocol.org/latest/specification/)
-[![a2a-sdk](https://img.shields.io/badge/a2a--sdk-1.0.3-3776AB.svg?logo=python&logoColor=white)](https://pypi.org/project/a2a-sdk/)
+[![A2A](https://img.shields.io/badge/A2A-wire_1.0_%7C_spec_1.0.1-4285F4.svg?logo=googlecloud&logoColor=white)](https://a2a-protocol.org/latest/specification/)
+[![a2a-sdk](https://img.shields.io/badge/a2a--sdk-1.1.2-3776AB.svg?logo=python&logoColor=white)](https://pypi.org/project/a2a-sdk/)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Linux Foundation](https://img.shields.io/badge/Governance-Linux_Foundation-003366.svg)](https://www.linuxfoundation.org/press/linux-foundation-launches-the-agent2agent-protocol-project-to-enable-secure-intelligent-communication-between-ai-agents)
 [![License](https://img.shields.io/badge/Protocol-Apache_2.0-D22128.svg)](https://github.com/a2aproject/A2A)
@@ -26,7 +26,10 @@ a2a-notes/
 │   ├── 01_agent_card.md          Card schema, skills, discovery, signed cards
 │   ├── 02_transport_and_rpc.md   JSON-RPC 2.0, gRPC, HTTP+JSON; RPC methods
 │   ├── 03_task_lifecycle.md      Task states, the state machine, errors
-│   └── 04_streaming_and_push.md  SSE streaming + push-notification webhooks
+│   ├── 04_streaming_and_push.md  SSE streaming + push-notification webhooks
+│   ├── 05_extensions_and_custom_bindings.md  Extension negotiation and bindings
+│   ├── 06_version_negotiation_and_migration.md Version rollout and compatibility
+│   └── 07_agent_payments_ap2.md  AP2 payment mandates over A2A
 │
 │ ── PYTHON SDK ─────────────────────────────────────────
 ├── 03_python/            Building A2A servers and clients with a2a-sdk
@@ -44,7 +47,9 @@ a2a-notes/
 └── 05_production/        Running A2A securely and at scale
     ├── 01_authentication.md      OAuth2/OIDC/API key/mTLS; card security schemes
     ├── 02_security_hardening.md  Card signing, input validation, threat model
-    └── 03_scaling_deployment.md  Stateless servers, task stores, observability
+    ├── 03_scaling_deployment.md  Stateless servers, task stores, observability
+    ├── 04_multi_tenant_scoping.md Tenant routing and resource isolation
+    └── 05_conformance_and_interoperability.md Inspector/TCK release validation
 ```
 
 ---
@@ -53,7 +58,7 @@ a2a-notes/
 
 ### Fundamentals — [full index](01_fundamentals/README.md)
 
-[![A2A](https://img.shields.io/badge/A2A-spec_1.0.0-4285F4.svg)](https://a2a-protocol.org/latest/specification/)
+[![A2A](https://img.shields.io/badge/A2A-wire_1.0_%7C_spec_1.0.1-4285F4.svg)](https://a2a-protocol.org/latest/specification/)
 
 | Guide | Description |
 |-------|-------------|
@@ -71,15 +76,18 @@ a2a-notes/
 | [Transport & RPC](02_protocol/02_transport_and_rpc.md) | JSON-RPC, gRPC, and HTTP+JSON bindings; the full set of RPC methods |
 | [Task Lifecycle](02_protocol/03_task_lifecycle.md) | The Task state machine, terminal states, input/auth-required pauses, error codes |
 | [Streaming & Push](02_protocol/04_streaming_and_push.md) | Server-Sent Events for live updates and webhooks for disconnected clients |
+| [Extensions & Bindings](02_protocol/05_extensions_and_custom_bindings.md) | Declaring, activating, and governing protocol extensions and custom bindings |
+| [Version Migration](02_protocol/06_version_negotiation_and_migration.md) | Explicit version selection and staged v0.3-to-v1.0 rollout |
+| [Agent Payments with AP2](02_protocol/07_agent_payments_ap2.md) | Where AP2 payment mandates extend an ordinary A2A task |
 
 ### Python SDK — [full index](03_python/README.md)
 
-[![a2a-sdk](https://img.shields.io/badge/a2a--sdk-1.0.3-3776AB.svg?logo=python&logoColor=white)](https://pypi.org/project/a2a-sdk/)
+[![a2a-sdk](https://img.shields.io/badge/a2a--sdk-1.1.2-3776AB.svg?logo=python&logoColor=white)](https://pypi.org/project/a2a-sdk/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-supported-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 
 | Guide | Description |
 |-------|-------------|
-| [SDK Setup](03_python/01_sdk_setup.md) | Installing `a2a-sdk`, optional extras, project layout, and version-compatibility notes |
+| [SDK Setup](03_python/01_sdk_setup.md) | Installing the 1.1.2 baseline, optional extras, project layout, and compatibility notes |
 | [Building a Server](03_python/02_building_a_server.md) | Implementing `AgentExecutor`, wiring request handlers, serving with Starlette or FastAPI |
 | [Building a Client](03_python/03_building_a_client.md) | Resolving Agent Cards, `ClientFactory`, sending tasks, consuming streams |
 
@@ -103,6 +111,8 @@ a2a-notes/
 | [Authentication](05_production/01_authentication.md) | Declaring and enforcing API key, OAuth2, OIDC, and mTLS auth in A2A |
 | [Security Hardening](05_production/02_security_hardening.md) | Card signing, input validation, the A2A threat model, and defensive patterns |
 | [Scaling & Deployment](05_production/03_scaling_deployment.md) | Stateless servers, shared task stores, push infrastructure, and observability |
+| [Multi-Tenant Scoping](05_production/04_multi_tenant_scoping.md) | Verified tenant routing and owner-scoped tasks, streams, jobs, and push configs |
+| [Conformance](05_production/05_conformance_and_interoperability.md) | Inspector/TCK and cross-binding release gates |
 
 ---
 
@@ -115,28 +125,31 @@ a2a-notes/
 
 1. [What Is A2A?](01_fundamentals/01_what_is_a2a.md) — understand the problem before the solution
 2. [Core Concepts](01_fundamentals/02_core_concepts.md) — learn the vocabulary every later file uses
-3. [A2A vs MCP](01_fundamentals/03_a2a_vs_mcp.md) — place A2A correctly in the agent stack
-4. [The Agent Card](02_protocol/01_agent_card.md) — the first concrete artifact you will create
+3. [A2A vs MCP](01_fundamentals/03_a2a_vs_mcp.md) — conceptual stop: you can now decide which protocol belongs where
+4. [The Agent Card](02_protocol/01_agent_card.md) — continue here when you will implement discovery
 
 ### Path 2 — Implementing in Python
 
-1. [Core Concepts](01_fundamentals/02_core_concepts.md) — required vocabulary
-2. [Transport & RPC](02_protocol/02_transport_and_rpc.md) — what the SDK does under the hood
-3. [SDK Setup](03_python/01_sdk_setup.md) — install and lay out the project
-4. [Building a Server](03_python/02_building_a_server.md) — expose your first agent
-5. [Building a Client](03_python/03_building_a_client.md) — call other agents
+1. [SDK Setup](03_python/01_sdk_setup.md) — install 1.1.2 and run the smoke test
+2. [Building a Server](03_python/02_building_a_server.md) — run the minimal echo agent first
+3. [Core Concepts](01_fundamentals/02_core_concepts.md) and [Transport & RPC](02_protocol/02_transport_and_rpc.md) — understand the working exchange
+4. [Task Lifecycle](02_protocol/03_task_lifecycle.md) — learn the terminal and interrupted states your executor must drive
+5. Return to the hardened sections of [Building a Server](03_python/02_building_a_server.md) — server-only stop after lifecycle, shutdown, and error tests pass
+6. [Building a Client](03_python/03_building_a_client.md) — continue for callers, orchestrators, streaming recovery, and auth
 
 ### Path 3 — Integrating an existing framework
 
-1. [Core Concepts](01_fundamentals/02_core_concepts.md) — vocabulary
-2. [The Agent Card](02_protocol/01_agent_card.md) — what your framework must publish
-3. The relevant [framework guide](04_frameworks/README.md) — LangGraph, ADK, CrewAI, etc.
-4. [Building a Client](03_python/03_building_a_client.md) — the consumption side
+Choose your branch and begin with its minimal exposure outcome: [LangChain/LangGraph](04_frameworks/01_langchain_langgraph.md), [Google ADK](04_frameworks/02_google_adk.md), or the direct [CrewAI, Semantic Kernel, LlamaIndex, and AG2 branches](04_frameworks/03_crewai_and_others.md#choose-a-branch-before-you-read-the-implementations). Pair it with [SDK Setup](03_python/01_sdk_setup.md) within your first two steps so the protocol dependency is pinned and verified.
+
+After the agent is exposed, use [Core Concepts](01_fundamentals/02_core_concepts.md) and [The Agent Card](02_protocol/01_agent_card.md) to understand and inspect what the adapter published. Stop after exposure tests pass. Continue to [Building a Client](03_python/03_building_a_client.md) only for lower-level consumption, custom credentials, or stream recovery not supplied by the framework.
 
 ### Path 4 — Shipping to production
 
+**Entry contract**: start with a working [server](03_python/02_building_a_server.md) and [client](03_python/03_building_a_client.md), plus a reviewed [Agent Card](02_protocol/01_agent_card.md).
+
 1. [Task Lifecycle](02_protocol/03_task_lifecycle.md) — model long-running work correctly
 2. [Streaming & Push](02_protocol/04_streaming_and_push.md) — handle disconnects and async results
-3. [Authentication](05_production/01_authentication.md) — lock down agent-to-agent calls
-4. [Security Hardening](05_production/02_security_hardening.md) — defend against the threat model
-5. [Scaling & Deployment](05_production/03_scaling_deployment.md) — run it at scale
+3. [Authentication](05_production/01_authentication.md) — establish and carry the caller principal
+4. [Security Hardening](05_production/02_security_hardening.md) and [Multi-Tenant Scoping](05_production/04_multi_tenant_scoping.md) — secure single-replica milestone
+5. [Scaling & Deployment](05_production/03_scaling_deployment.md) — continue for multiple replicas, durable jobs, or operational SLOs
+6. [Conformance & Interoperability](05_production/05_conformance_and_interoperability.md) — release gate every advertised binding

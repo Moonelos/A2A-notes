@@ -19,7 +19,7 @@ The first question almost everyone asks is "A2A or MCP — which one do I pick?"
 | Interaction shape | Function call: structured input → output | Task lifecycle: messages, streaming, multi-turn |
 | Governance | Agentic AI Foundation (Linux Foundation), after Anthropic donated MCP in December 2025 | Agent2Agent Protocol Project (Linux Foundation), after Google donated A2A in June 2025 |
 
-> **Key insight**: MCP is the *internal wiring* of an agent. A2A is the *external collaboration* between agents. Asking "A2A or MCP" is like asking "a USB port or a network cable" — you want both, for different jobs.
+MCP is commonly the internal wiring of an agent, while A2A is external collaboration between agents. The analogy is directional, not exclusive: either protocol can cross a process or organizational boundary.
 
 Both protocols now live under the broader **Linux Foundation** umbrella, but not in the same project. A2A is hosted by the Linux Foundation's **Agent2Agent Protocol Project**. MCP moved to the Linux Foundation's **Agentic AI Foundation** in December 2025, alongside AGENTS.md and goose. The practical architecture point is unchanged: A2A and MCP are complements, not rivals.
 
@@ -58,7 +58,7 @@ Picture a single agent at the center of a cross. MCP runs **down**, A2A runs **a
 - **Going down (MCP)**: the Trip Planner reaches its own tools — a calendar, a weather API, a maps service. These are well-defined primitives with structured inputs and outputs. They do not reason; they execute.
 - **Going across (A2A)**: the Trip Planner talks to *other agents* — a Flights agent, a Hotel agent — as peers. Those agents reason, plan, hold state across turns, and may use *their own* MCP tools underneath.
 
-> **Key insight**: Every agent on the horizontal axis is itself the center of its own vertical MCP cross. The architecture is fractal — A2A between, MCP within.
+Every peer on the horizontal axis can itself use MCP tools beneath it: A2A between agents, MCP within an agent's capability layer.
 
 ---
 
@@ -83,9 +83,9 @@ The protocols feel different the moment you look at what they expose.
 | **Message** | A turn in a conversation between client and remote agent — request or update. |
 | **Artifact** | A concrete output produced by a Task (a document, an image, structured data). |
 
-The shapes tell the story. MCP's `Tool` is a **function** — you call it and get a value back. A2A's `Task` is a **process** — it has states, it can stream progress, it can pause to ask you a question, and it can hand back rich `Artifact`s when done. MCP optimizes for *invocation*; A2A optimizes for *delegation*.
+The shapes still differ, but lifecycle alone is no longer the discriminator. An ordinary MCP `Tool` is a function-like invocation. The official **MCP Tasks extension** can add durable long-running execution, polling, progress metadata, and an `input_required` pause. A2A Tasks provide lifecycle together with peer discovery, agent messages, artifacts, and collaboration context. MCP optimizes for exposing a host capability; A2A optimizes for delegating to an autonomous peer.
 
-⚠️ A common mistake: modeling a long-running, multi-turn collaboration as an MCP tool call. Tool calls have no first-class notion of "still working, here's an update" or "I need more input from you." You will end up reinventing the A2A `Task` lifecycle badly. If the work reasons and takes turns, it is an A2A Task.
+⚠️ A common mistake is choosing A2A only because work is long-running. If a host needs a durable operation from one of its own capabilities, MCP Tasks may be sufficient. Choose A2A when the counterpart is an autonomous, discoverable peer whose messages, artifacts, and collaboration context are part of the contract.
 
 ---
 
@@ -96,11 +96,13 @@ The shapes tell the story. MCP's `Tool` is a **function** — you call it and ge
 | The counterpart is a function/API/data store | ✅ | ❌ |
 | The counterpart reasons, plans, or chooses its own tools | ❌ | ✅ |
 | Interaction is a single structured request → response | ✅ | ❌ |
-| Interaction is multi-turn, may pause for input, may stream | ❌ | ✅ |
+| One host capability needs durable polling/progress/input pause | ✅ (MCP Tasks) | possible, usually unnecessary |
+| An autonomous peer needs multi-turn messages and artifacts | possible adapter | ✅ |
 | You need discovery of *who* can do a job (capability catalog) | ❌ | ✅ (Agent Card) |
 | You want to pull a document/record into the model's context | ✅ (Resource) | ❌ |
 | The counterpart is owned by a different team/org/vendor | possible | ✅ (preferred) |
-| You need an auditable task lifecycle with status and artifacts | ❌ | ✅ |
+| You need lifecycle only, without peer-agent semantics | ✅ (MCP Tasks) | possible |
+| You need lifecycle plus agent discovery/messages/artifacts | ❌ | ✅ |
 
 > **Rule of thumb**: If you are *using* a capability, that's MCP. If you are *partnering* with something that has its own judgment, that's A2A.
 
@@ -121,7 +123,7 @@ A `ShopManager` agent runs a multi-turn diagnostic conversation with a customer 
 
 A support assistant that answers from a knowledge base, hits a ticketing API, and reads user records needs **no A2A at all**. Nothing here is a peer agent — it's all tools and data. Reaching for A2A would add a coordination layer with nothing to coordinate.
 
-> **Key insight**: Not every system needs both. MCP-only is the right answer for a single agent with tools. A2A enters the moment a *second reasoning agent* appears — especially one you do not own.
+Not every system needs both. MCP-only is often right for a single agent with tools, including durable MCP Tasks. A2A enters when another autonomous peer and its collaboration contract matter.
 
 ---
 
@@ -134,13 +136,13 @@ The protocols are bridgeable in both directions:
 
 These bridges are legitimate adapters at a boundary. But keeping each protocol at its **natural layer** is cleaner, and here is why:
 
-- ❌ **Wrapping an A2A agent as an MCP tool flattens it.** You lose the `Task` lifecycle — no streaming `working` updates, no `input-required` pause, no rich `Artifact`s. A multi-turn negotiation gets crushed into one request/response. The spec says it directly: A2A's strength is *stateful, collaborative* interaction, and a tool call cannot express that.
+- ❌ **Wrapping an A2A agent as a plain MCP tool flattens its collaboration model.** MCP Tasks can preserve long-running state, progress, polling, and input pauses, but the adapter must still map or discard A2A discovery, Message, Artifact, and peer-context semantics. Use that bridge only when the MCP host does not need the full A2A contract.
 - ❌ **Wrapping an MCP tool as an A2A agent adds ceremony for nothing.** A stateless API call gains Agent Card discovery, task state machines, and message turns it never needed. More moving parts, more failure surface, no benefit.
 - ✅ **Match the protocol to the relationship.** Tool-shaped thing on the vertical axis with MCP. Agent-shaped peer on the horizontal axis with A2A. The code reads the way the system actually works.
 
 ⚠️ The honest exception: a real org boundary. If the *only* thing a partner exposes is an MCP endpoint, wrap it — pragmatism beats purity at a boundary you do not control. Just treat the wrapper as an adapter, not as your default architecture.
 
-> **Key insight**: The bridges exist for interop at the edges, not as a design pattern for the core. Build vertical with MCP, horizontal with A2A, and only adapt where an external boundary forces your hand.
+> **Key insight**: Duration no longer decides between MCP and A2A. Choose MCP Tasks for a durable host capability; choose A2A when the remote party's autonomous identity, discovery, messages, artifacts, and collaboration context are part of the contract.
 
 ---
 

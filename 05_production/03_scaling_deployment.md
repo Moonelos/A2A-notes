@@ -1,8 +1,10 @@
 # Scaling & Deploying A2A Servers
 
+> **Length note**: This production runbook keeps state, execution, deployment, observability, and failure recovery together because their shutdown and ownership contracts must be reviewed as one system.
+
 > **Who this is for**: Engineers taking an A2A agent from a single-process prototype to a horizontally-scaled production deployment. Before reading this, understand how a server is wired up: **[Building a Server](../03_python/02_building_a_server.md)**, and how streaming works on the wire: **[Streaming & Push](../02_protocol/04_streaming_and_push.md)**.
 
-The default `a2a-sdk` server you build from the quickstart runs fine on one machine. The moment you put two replicas behind a load balancer, a pile of in-process assumptions break: Task state lives in one replica's RAM, a live SSE stream and its `SubscribeToTask` attempt may land on different replicas, and a 40-minute task is pinned to the lifetime of one HTTP request. This file is about fixing all of that.
+The default `a2a-sdk` 1.1.2 server you build from the quickstart runs fine on one machine. The moment you put two replicas behind a load balancer, a pile of in-process assumptions break: Task state lives in one replica's RAM, a live Server-Sent Events (SSE) stream and its `SubscribeToTask` attempt may land on different replicas, and a 40-minute task is pinned to the lifetime of one HTTP request. This file is about fixing all of that.
 
 ---
 
@@ -17,7 +19,7 @@ The `a2a-sdk` request handler delegates all persistence to three pluggable abstr
 | `TaskStore` | `InMemoryTaskStore` | `DatabaseTaskStore` (SQLAlchemy) or a custom Redis/Postgres store |
 | `PushNotificationConfigStore` | `InMemoryPushNotificationConfigStore` | `DatabasePushNotificationConfigStore` |
 
-⚠️ **SDK v1.0 reality check**: `DefaultRequestHandler` persists task state through `TaskStore`, but its live active-task/event fan-out is process-local. The old `queue_manager=` constructor argument is kept for backward compatibility and is not the cross-replica solution in v1.0. Use shared task storage for polling and terminal recovery, and use push notifications or your own worker/broker layer for long-running, cross-replica execution.
+⚠️ **SDK 1.1.2 reality check**: `DefaultRequestHandler` aliases the v2 handler and persists snapshots through `TaskStore`, but its `ActiveTaskRegistry` and live event fan-out remain process-local. The old `queue_manager=` argument is compatibility surface, not a cross-replica solution. Use shared task storage for polling and terminal recovery, and a durable worker/broker layer for execution ownership.
 
 ### The TaskStore interface
 
@@ -25,7 +27,7 @@ The `a2a-sdk` request handler delegates all persistence to three pluggable abstr
 
 ```bash
 # Pick the driver matching your DB. 'sql' pulls all of them.
-pip install "a2a-sdk[postgresql]"   # asyncpg
+pip install "a2a-sdk[postgresql,encryption]"  # asyncpg + encrypted push config
 pip install "a2a-sdk[mysql]"        # aiomysql
 pip install "a2a-sdk[sqlite]"       # aiosqlite — single-node only, not for scale-out
 ```
@@ -34,6 +36,7 @@ Wiring `DatabaseTaskStore` into the server:
 
 ```python
 from sqlalchemy.ext.asyncio import create_async_engine
+from a2a.server.owner_resolver import resolve_user_scope
 from a2a.server.tasks import DatabaseTaskStore, DatabasePushNotificationConfigStore
 from a2a.server.request_handlers import DefaultRequestHandler
 
@@ -45,7 +48,11 @@ engine = create_async_engine(
     pool_pre_ping=True,   # drops dead connections instead of erroring mid-request
 )
 
-task_store = DatabaseTaskStore(engine, create_table=True)
+task_store = DatabaseTaskStore(
+    engine,
+    create_table=True,
+    owner_resolver=resolve_user_scope,
+)
 push_store = DatabasePushNotificationConfigStore(
     engine,
     create_table=True,
@@ -59,46 +66,20 @@ await push_store.initialize()
 handler = DefaultRequestHandler(
     agent_executor=MyAgentExecutor(),
     task_store=task_store,
+    agent_card=agent_card,  # the same validated card served by discovery routes
     push_config_store=push_store,
 )
 ```
 
+`resolve_user_scope(context)` must receive the authenticated owner established at ingress. The shipped database store includes that owner in save/get/list/delete predicates; verify your HTTP/gRPC adapter actually populates the context before relying on it. Generate the Fernet key using the SDK encryption utility or `Fernet.generate_key()`, store it in a secrets manager, and rotate it with an explicit decrypt-and-re-encrypt migration—losing it makes stored callback credentials unreadable.
+
 ⚠️ `create_table=True` is convenient for dev but races when N replicas boot at once. In production set `create_table=False` and run schema migrations as a separate deploy step (Alembic, or a one-shot `db-cli` job).
 
-### A custom Redis TaskStore
+### A custom store must implement the whole ownership contract
 
-If you already run Redis and don't want a SQL dependency, implement `TaskStore` directly. The shape is small:
+Do not copy a task-ID-only Redis example into production. The current `TaskStore` abstract interface requires `save`, `get`, `list`, and `delete`, each with a `ServerCallContext`. Every Redis key and index must include `resolve_user_scope(context)`—for example `a2a:{owner}:task:{task_id}` and `a2a:{owner}:tasks`—and `list` must filter only that owner before applying context/status filters and page tokens. It must return `ListTasksResponse` with `tasks`, `totalSize`, `pageSize`, and `nextPageToken`; the handler then applies requested history length and artifact inclusion. Use atomic transactions/Lua for blob-plus-index updates, opaque signed page tokens, and a time-to-live (TTL) policy that expires the blob and owner index consistently.
 
-```python
-import redis.asyncio as aioredis
-from google.protobuf.json_format import MessageToJson, Parse
-from a2a.server.tasks import TaskStore
-from a2a.types import Task
-
-class RedisTaskStore(TaskStore):
-    """Tasks as JSON blobs keyed by task id, with a TTL so completed
-    tasks don't accumulate forever."""
-
-    def __init__(self, client: aioredis.Redis, ttl_seconds: int = 86_400):
-        self._redis = client
-        self._ttl = ttl_seconds
-
-    def _key(self, task_id: str) -> str:
-        return f"a2a:task:{task_id}"
-
-    async def save(self, task: Task, context=None) -> None:
-        # ProtoJSON keeps the stored representation aligned with the wire format.
-        await self._redis.set(self._key(task.id), MessageToJson(task), ex=self._ttl)
-
-    async def get(self, task_id: str, context=None) -> Task | None:
-        raw = await self._redis.get(self._key(task_id))
-        return Parse(raw.decode("utf-8"), Task()) if raw else None
-
-    async def delete(self, task_id: str, context=None) -> None:
-        await self._redis.delete(self._key(task_id))
-
-    # Implement list(...) as well if you need ListTasks over Redis.
-```
+The shipped `DatabaseTaskStore` is the safer baseline because those owner predicates and list semantics are already implemented. A custom store is complete only after tests prove that owner A cannot get, list, overwrite, or delete owner B's task—even with a known task ID or page token.
 
 ✅ With a shared store, any replica can answer `GetTask` and list completed or in-progress task snapshots.
 ❌ Leaving `InMemoryTaskStore` in place under a load balancer produces "task not found" errors that depend on which replica you hit — the worst kind of intermittent bug.
@@ -160,7 +141,31 @@ SendMessage  ──▶  web tier: persist Task(state=TASK_STATE_SUBMITTED), enqu
 
 The worker should emit the same durable state changes an in-request executor would — `TASK_STATE_WORKING`, artifact updates, and exactly one terminal state. Because those updates are persisted through the shared `TaskStore`, progress is visible to `GetTask`; because push configs are shared, completion can be delivered by webhook. If you also need live SSE, publish the same events to your broker-backed streaming layer.
 
-For completion, **push notifications** close the loop without the client holding a connection open: the client registers a webhook (`TaskPushNotificationConfig`) when it sends the task; on terminal state a push sender POSTs a `StreamResponse` update to that URL. This is the right pattern for fire-and-forget and for tasks measured in minutes or hours. See [Streaming & Push](../02_protocol/04_streaming_and_push.md) for the protocol-level mechanics.
+### The durable acceptance/lease path
+
+A queue message alone is not ownership. Use one database transaction to create the submitted task, a durable job record, and an outbox row. A dispatcher publishes the outbox row and marks it sent. Workers claim jobs with a renewable lease and persist each state/event idempotently:
+
+```sql
+BEGIN;
+INSERT INTO tasks(owner, id, state, version) VALUES (:owner, :task, 'SUBMITTED', 1);
+INSERT INTO jobs(owner, task_id, message_id, state)
+VALUES (:owner, :task, :message, 'READY');
+INSERT INTO outbox(event_id, topic, payload)
+VALUES (:event_id, 'a2a.jobs', :job_payload);
+COMMIT;
+
+-- Worker claim; only one worker obtains the lease.
+UPDATE jobs SET state='RUNNING', lease_owner=:worker,
+                lease_until=NOW() + INTERVAL '60 seconds'
+WHERE owner=:owner AND task_id=:task
+  AND state IN ('READY','RUNNING')
+  AND (lease_until IS NULL OR lease_until < NOW())
+RETURNING *;
+```
+
+The web response is observable immediately: `GetTask` returns `SUBMITTED`. After a successful claim, the worker transaction changes it to `WORKING`; artifact/status events use a unique event ID so retries become no-ops; completion stores `COMPLETED` and a push-outbox row in the same transaction. If the worker crashes, its lease expires, another worker claims the durable job, loads the last checkpoint, and replays idempotently. If no checkpoint exists, restart from the beginning only when tools and writes have idempotency keys.
+
+Push notifications close the loop without the client holding a connection open: the client registers a webhook (`TaskPushNotificationConfig`), and the sender POSTs `StreamResponse` task/message/status/artifact updates. The protocol requires at least one delivery attempt per configured webhook; retry/backoff is optional at protocol level but should be a bounded production policy. See [Streaming & Push](../02_protocol/04_streaming_and_push.md) for the payload and authentication mechanics.
 
 ⚠️ Webhook delivery is a network call to an untrusted endpoint — it must be retried with backoff, time-limited, and authenticated (signed token / mTLS). Never let a slow webhook block a worker; dispatch it as its own job.
 
@@ -177,7 +182,8 @@ FROM python:3.12-slim AS build
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install \
-    "a2a-sdk[postgresql,telemetry]" -r requirements.txt
+    "a2a-sdk[postgresql,telemetry,encryption]" \
+    "opentelemetry-exporter-otlp-proto-grpc" -r requirements.txt
 
 FROM python:3.12-slim
 WORKDIR /app
@@ -239,7 +245,7 @@ spec:
 ```
 
 - **Readiness vs liveness**: readiness should check that the DB engine and Redis are reachable — a replica that can't reach shared state must not receive traffic. Liveness should be a cheap in-process check; don't fail liveness on a transient DB blip or Kubernetes will restart-loop the whole fleet.
-- **HPA**: scale the web tier on CPU/RPS. Scale the **worker tier** on **queue depth** (a custom/external metric) — that, not CPU, is the true signal of task backlog. A web tier HPA can't see work piling up in the job queue.
+- **Horizontal Pod Autoscaler (HPA)**: scale the web tier on CPU or requests per second (RPS). Scale the **worker tier** on **queue depth** (a custom/external metric)—that, not CPU, is the true signal of task backlog. A web-tier HPA cannot see work piling up in the job queue.
 - Ingress controllers need the same `proxy-buffering: "off"` and timeout annotations as the Nginx block above.
 
 ---
@@ -253,27 +259,42 @@ You cannot operate a multi-hop agent system blind. A single user request may fan
 The SDK ships first-class OTel support behind an extra:
 
 ```bash
-pip install "a2a-sdk[telemetry]"
+pip install "a2a-sdk[telemetry]" opentelemetry-exporter-otlp-proto-grpc
 ```
 
-`a2a.utils.telemetry` provides `trace_function` and `trace_class` decorators — automatic span creation, sync + async support, exception recording, and a `attribute_extractor` callback for dynamic span attributes. Crucially, the SDK **propagates W3C Trace Context** across the A2A protocol boundary, so a trace started in the client continues through every downstream agent hop as one connected trace.
+`a2a.utils.telemetry` provides `trace_function` and `trace_class` decorators for span creation and exception recording. It does **not** inject or extract W3C Trace Context for you. Instrument the HTTP/gRPC carrier or write interceptors that explicitly inject outbound `traceparent`/`tracestate` headers and extract them before the server span begins.
 
 ```python
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.context import attach, detach
+from opentelemetry.propagate import extract, inject
 from a2a.utils.telemetry import trace_function
 
 provider = TracerProvider()
 provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))  # -> collector
 trace.set_tracer_provider(provider)
 
+def inject_a2a_headers(headers: dict[str, str]) -> None:
+    """Call from the outbound HTTP interceptor before sending."""
+    inject(headers)
+
+
+async def dispatch_inbound(request):
+    """Call at ingress before the SDK handler creates server spans."""
+    token = attach(extract(dict(request.headers)))
+    try:
+        return await dispatch_to_a2a_handler(request)
+    finally:
+        detach(token)
+
+
 class MyAgentExecutor(AgentExecutor):
     @trace_function(attributes={"agent": "research"})
     async def execute(self, context, event_queue):
-        # This span links to the parent span carried in the inbound
-        # A2A request headers — no manual context plumbing needed.
+        # Parent linkage exists because dispatch_inbound extracted it explicitly.
         ...
 ```
 
@@ -293,7 +314,7 @@ logger.info(
 
 | Metric | Type | Why it matters |
 |---|---|---|
-| Task latency (submit → terminal) | histogram | SLO tracking; p99 catches tail stalls |
+| Task latency (submit → terminal) | histogram | Service-level objective (SLO) tracking; p99 catches tail stalls |
 | Task state distribution | gauge | A growing `working` count = stuck/leaking tasks |
 | Error rate (`failed` / total) | counter ratio | Primary alerting signal |
 | Event queue depth | gauge | Worker-tier HPA input; backlog early warning |
@@ -314,19 +335,25 @@ client = httpx.AsyncClient(
 )
 ```
 
-**Retries with backoff** — retry only idempotent, transient failures (timeouts, 5xx, connection resets). Exponential backoff with jitter; never retry a `4xx`.
+**Retries with backoff** — retry only operations known to be idempotent and failures likely to be transient: timeouts, connection resets, selected `5xx`, and conditionally `408`, `425`, or `429`. Honor `Retry-After` where defined, use exponential backoff with jitter and bounded attempts, and treat other `4xx` responses as permanent.
 
-> **Rule**: A retried `SendMessage` must be **idempotent**. Generate a stable `messageId` (a client-side UUID) and reuse it on retry, so a duplicate delivery can be recognized as the *same* message rather than starting a second task.
+> **Rule**: A2A says `SendMessage` **MAY** be idempotent and a server **MAY** use `messageId`; a stable ID is not a guarantee by itself. Retry only when the server advertises or contractually promises durable deduplication. Its acceptance transaction stores `(owner, messageId) → taskId/result` under a uniqueness constraint; a duplicate returns that stored result instead of enqueueing another job.
 
 **Circuit breakers** — wrap each remote agent. After a threshold of failures, open the breaker and fail fast for a cooldown instead of hammering a downed agent and exhausting your own connection pool. One slow dependency should not cascade into a fleet-wide stall.
 
-**Graceful shutdown** — on `SIGTERM`: stop accepting new tasks (fail readiness so the LB drains you), let in-flight tasks finish or checkpoint, flush the OTel span processor, close DB and Redis pools, then exit. Set `terminationGracePeriodSeconds` longer than your drain window. Because task state is in the shared `TaskStore`, a task interrupted by shutdown can be **resumed by another replica or worker** — provided your executor checkpoints progress rather than holding it in local variables.
+**Graceful shutdown** — on `SIGTERM`: stop accepting new tasks (fail readiness so the LB drains you), drain the SDK handler, let owned worker jobs finish or checkpoint and release leases, flush telemetry, then close shared clients. Set `terminationGracePeriodSeconds` longer than the drain window. A `TaskStore` snapshot alone cannot transfer execution: failover also requires a durable job record, lease/claim protocol, checkpoint, and idempotent worker as shown in §3.
 
 ```python
-async def shutdown():
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app):
+    yield
     app.state.draining = True          # /health/ready now returns 503
-    await drain_in_flight(timeout=30)  # bounded wait for active tasks
-    provider.force_flush()             # don't lose the last traces
+    await handler.aclose()             # drains 1.1.2 ActiveTask background work
+    await release_or_checkpoint_worker_leases(timeout=30)
+    provider.force_flush()
+    await http_client.aclose()
     await engine.dispose()
     await redis_client.aclose()
 ```
@@ -352,10 +379,10 @@ async def shutdown():
 | Observability | Structured logs keyed by `taskId` / `contextId` | ☐ |
 | Observability | Metrics + alerts on error rate, latency p99, queue depth | ☐ |
 | Resilience | Client timeouts, backoff retries, circuit breakers in place | ☐ |
-| Resilience | `SendMessage` idempotent via stable `messageId` | ☐ |
+| Resilience | Durable `(owner, messageId)` deduplication exists before retrying `SendMessage` | ☐ |
 | Resilience | Graceful shutdown drains in-flight tasks, flushes telemetry | ☐ |
 
-> **Key insight**: Every production concern here reduces to one principle — **no replica may own anything**. Task state, event streams, and execution lifetime all live outside the process, so any replica is disposable and any task survives a restart. Get that right and horizontal scaling, rolling deploys, and failure recovery all fall out for free.
+> **Key insight**: Shared snapshots make tasks visible across replicas; they do not make execution durable. A disposable web tier needs owner-scoped state plus a durable job, lease, checkpoint, idempotent event log, and shutdown contract before a task can safely survive failover.
 
 ---
 

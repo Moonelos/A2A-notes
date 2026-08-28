@@ -4,13 +4,32 @@
 
 Before reading this, understand how A2A messages move over the wire: **[Transport & RPC](../02_protocol/02_transport_and_rpc.md)**.
 
+## Quick start: prove the pinned SDK works
+
+Install the current repository baseline into an active Python 3.10+ environment:
+
+```bash
+python -m pip install "a2a-sdk==1.1.2"
+python -c "from importlib.metadata import version; from a2a.types import AgentCard; print(f'a2a-sdk {version(\"a2a-sdk\")} install OK')"
+```
+
+Expected output:
+
+```text
+a2a-sdk 1.1.2 install OK
+```
+
+If the import fails, `python -m pip --version` and `python --version` usually reveal that `pip` installed into a different environment. If the version differs, an existing lockfile or environment constraint won; resolve that before copying SDK examples.
+
+> **Production:** the base package proves the Protocol Buffers model imports. Add the specific server, transport, database, signing, encryption, or telemetry extra only when the next note uses it.
+
 ---
 
 ## 1. What `a2a-sdk` Is
 
-`a2a-sdk` is the **official Python SDK** for the Agent2Agent (A2A) protocol, maintained at [`github.com/a2aproject/a2a-python`](https://github.com/a2aproject/a2a-python). It is async-first, requires **Python 3.10+** (tested through 3.14), and ships the protocol's data model as generated protobuf classes.
+`a2a-sdk` is the **official Python SDK** for the Agent2Agent (A2A) protocol, maintained at [`github.com/a2aproject/a2a-python`](https://github.com/a2aproject/a2a-python). It is async-first, requires **Python 3.10+** (tested through 3.14), and ships the protocol model as generated **Protocol Buffers** classes. These classes enforce the wire schema and field-presence rules; they are not ordinary Python data classes with arbitrary attributes.
 
-As of **May 2026 the current release is `1.0.3`** (published 2026-05-13). The `1.0.x` line implements **A2A spec v1.0.0** and includes a **0.3 compatibility mode** for talking to older agents.
+The checked baseline is **`1.1.2`** (released 2026-07-20). It implements wire protocol **1.0** and includes compatibility support for older 0.3 peers. Patch releases of the specification do not change the negotiated `Major.Minor` wire value.
 
 The SDK gives you three layers:
 
@@ -111,7 +130,7 @@ name = "my-agent"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
-    "a2a-sdk[http-server]==1.0.3",
+    "a2a-sdk[http-server]==1.1.2",
     "uvicorn>=0.30",
 ]
 
@@ -161,9 +180,9 @@ Error types (`TaskNotFoundError`, `InvalidParamsError`, `UnsupportedOperationErr
 | `a2a.server.tasks`              | `InMemoryTaskStore`, `DatabaseTaskStore`, `TaskStore`, `TaskUpdater`, `TaskManager` |
 | `a2a.server.events`             | `EventQueue`, `QueueManager`, `InMemoryQueueManager`            |
 
-You implement `AgentExecutor`, hand it to `DefaultRequestHandler` along with a `TaskStore`, then turn the handler into ASGI routes via the `create_*_routes` factories and mount them on Starlette/FastAPI.
+You implement `AgentExecutor`, hand it to `DefaultRequestHandler` along with a `TaskStore`, then turn the handler into **Asynchronous Server Gateway Interface (ASGI)** routes via the `create_*_routes` factories. ASGI is the async Python web-server contract that lets Starlette or FastAPI host those generated routes.
 
-💡 `DefaultRequestHandler` is an alias for `DefaultRequestHandlerV2` in `1.0.x`. The older `LegacyRequestHandler` is still exported for 0.3-style code paths — prefer `DefaultRequestHandler` for new agents.
+💡 In `1.1.2`, `DefaultRequestHandler` aliases `DefaultRequestHandlerV2` and uses a process-local active-task registry. The older `LegacyRequestHandler` remains for 0.3-style paths; prefer `DefaultRequestHandler` for new agents and close it during application shutdown.
 
 ### 4.3 `a2a.client` — talking to agents
 
@@ -185,7 +204,7 @@ Transports live under `a2a.client.transports` (`jsonrpc`, `rest`, `grpc`); the f
 
 ### 4.5 `a2a.compat` — 0.3 interoperability
 
-`a2a.compat.v0_3` holds the JSON-RPC / REST / gRPC adapters and model conversions that let a `1.0.x` SDK speak to spec-0.3 agents. You rarely import it directly — the request handler and client transports reach into it when version negotiation requires it.
+`a2a.compat.v0_3` holds the JSON-RPC / REST / gRPC adapters and model conversions that let a `1.1.x` SDK speak to protocol-0.3 agents. You rarely import it directly — request handlers and transports use it when version negotiation requires it.
 
 ---
 
@@ -195,79 +214,32 @@ The SDK version and the spec version are **not** the same number — track both.
 
 | SDK version      | Spec implemented | Notes                                                  |
 |------------------|------------------|--------------------------------------------------------|
-| `1.0.x` (e.g. `1.0.3`) | A2A v1.0.0  | Current. Includes 0.3 compatibility mode               |
+| `1.1.x` (baseline `1.1.2`) | A2A protocol 1.0 | Current checked line; includes 0.3 compatibility and current handler shutdown behavior |
+| `1.0.x` | A2A protocol 1.0 | Older stable SDK line; upgrade deliberately |
 | `0.3.x` and earlier    | A2A v0.3.x  | Pre-1.0. Different class names and module layout       |
 
 Key points:
 
 - **`1.0.0` was a breaking release.** Classes were renamed and modules reorganized between the `0.x` line and `1.0`. Code or tutorials written against `0.2`/`0.3` will not import cleanly under `1.0.x`.
-- **0.3 compatibility mode** is about *interoperability on the wire*, not source compatibility. A `1.0.x` agent can negotiate down to talk to a `0.3` peer via `a2a.compat.v0_3` — but your Python source still uses the `1.0` class names.
+- **0.3 compatibility mode** is about interoperability on the wire, not source compatibility. A `1.1.x` agent can negotiate down when configured to do so, but your Python source still uses current class names. Clients that require 1.0 features should disable silent fallback.
 - The `request_handlers` package keeps a `LegacyRequestHandler` for 0.3-style server semantics; `DefaultRequestHandler` is the v2 (1.0) handler.
 
-> **Rule**: Always pin the SDK — `a2a-sdk==1.0.3`, not `a2a-sdk>=1.0`. An unpinned dependency can silently jump a minor version, and pre-1.0 examples you copy from the web may reference classes that no longer exist. Pin it, then upgrade deliberately.
+> **Rule**: Pin the SDK — `a2a-sdk==1.1.2`, not `a2a-sdk>=1.0`. Minor releases can change lifecycle behavior even when the wire protocol remains 1.0. Pin, read the changelog, run conformance checks, then upgrade deliberately.
 
 ⚠️ When following a blog post or tutorial, check its date and the SDK version it targets. An import like `from a2a.server.apps import A2AStarletteApplication` is a 0.x-era pattern; in `1.0.x` you compose routes with the `create_*_routes` factories instead.
 
 ---
 
-## 6. Install Smoke Test
+## 6. Prove the extra you intend to use
 
-Confirm the install by importing `a2a.types` and constructing an `AgentCard` entirely in memory — no network, no server:
-
-```python
-"""smoke_test.py — verify a2a-sdk is installed and importable."""
-from importlib.metadata import version
-
-from a2a.types import AgentCard, AgentCapabilities, AgentInterface, AgentSkill
-
-
-def main() -> None:
-    print(f"a2a-sdk version: {version('a2a-sdk')}")
-
-    card = AgentCard(
-        name="smoke-test-agent",
-        description="An in-memory agent card built to verify the install.",
-        version="0.1.0",
-        supported_interfaces=[
-            AgentInterface(
-                protocol_binding="JSONRPC",
-                protocol_version="1.0",
-                url="http://localhost:9999/",
-            )
-        ],
-        capabilities=AgentCapabilities(streaming=True),
-        default_input_modes=["text/plain"],
-        default_output_modes=["text/plain"],
-        skills=[
-            AgentSkill(
-                id="echo",
-                name="Echo",
-                description="Returns whatever it receives.",
-                tags=["demo"],
-            )
-        ],
-    )
-
-    print(f"Constructed AgentCard: {card.name} ({len(card.skills)} skill(s))")
-    print("a2a-sdk install OK")
-
-
-if __name__ == "__main__":
-    main()
-```
-
-Run it:
+The opening smoke test proves only the base model. Before continuing to the server note, verify the HTTP extra itself:
 
 ```bash
-python smoke_test.py
-# a2a-sdk version: 1.0.3
-# Constructed AgentCard: smoke-test-agent (1 skill(s))
-# a2a-sdk install OK
+python -m pip install "a2a-sdk[http-server]==1.1.2"
+python -c "from a2a.server.routes import create_jsonrpc_routes; print('http-server OK')"
 ```
 
-If the import fails, you installed into the wrong environment — check `which python` against your active venv. If construction raises a validation error, the SDK version differs from this snippet's field names; re-check your pin against Section 5.
-
-💡 To also verify the `http-server` extra: `python -c "from a2a.server.routes import create_jsonrpc_routes; print('http-server OK')"`. A clean run means Starlette is present.
+The success signal is `http-server OK`. An `ImportError` that names an optional dependency means the base SDK is present but that extra is missing; a clean `import a2a` alone would not expose this silent mismatch.
 
 ---
 
