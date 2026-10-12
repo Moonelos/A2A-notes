@@ -259,6 +259,37 @@ A JSON-RPC error response replaces `result` with an `error` object:
 
 Clients branch first on the binding's native error code or type. Only inspect `reason` and `domain` when a typed `ErrorInfo` detail is actually present; do not make optional detail the sole error identity.
 
+## Recap and check yourself
+
+- The Agent Card advertises an interface; the selected binding maps the same abstract A2A operation to its own wire envelope.
+- A successful HTTP exchange can still contain a JSON-RPC `error`; inspect both layers before using the result.
+- A JSON-RPC response has one `result` or one `error`. The returned `result` itself has one A2A result variant.
+- The client must retain the chosen interface and version across later Task operations.
+
+**Q: The Recipe Agent returns HTTP 200 with JSON-RPC `error.code = -32001`. Did the HTTP exchange fail?**
+
+<details><summary>Answer</summary>
+
+The HTTP transport succeeded. The JSON-RPC method returned `TaskNotFoundError`, so the client should inspect the `error` object and check the task ID and access scope.
+
+</details>
+
+**Q: A client selected the HTTP+JSON interface but sends a JSON-RPC `method` envelope to its REST URL. What failed first?**
+
+<details><summary>Answer</summary>
+
+The client mixed bindings. The interface URL determines the path and body shape. Choosing an operation such as `SendMessage` does not make JSON-RPC syntax valid at an HTTP+JSON endpoint.
+
+</details>
+
+**Try it.** The Recipe Agent's card advertises both JSON-RPC and HTTP+JSON. Choose the HTTP+JSON binding for a flour conversion and sketch the request path and body. Hint: use the operation map above, then put the user Message in the REST body without a JSON-RPC `method` wrapper.
+
+<details><summary>Worked solution</summary>
+
+Send `POST /message:send` to the advertised HTTP+JSON URL with `A2A-Version: 1.0` and `Content-Type: application/a2a+json`. The JSON body contains the `message` and its `messageId`, role, and text Part. Inspect the HTTP status and the returned Message or Task; a JSON-RPC `id`, `method`, or `params` wrapper would target the wrong binding.
+
+</details>
+
 ---
 
 **Next**: [Part 3: Task Lifecycle](03_task_lifecycle.md)

@@ -2,11 +2,11 @@
 
 > **Who this is for**: Python engineers about to build an A2A server or client. You're comfortable with `async`/`await`, virtual environments, and `pip`. By the end you'll have a verified install, a clean project skeleton, and a mental map of the SDK's packages.
 
-Before reading this, understand how A2A messages move over the wire: **[Transport & RPC](../02_protocol/02_transport_and_rpc.md)**.
+You can run the pinned install before studying the wire format. [Transport & RPC](../02_protocol/02_transport_and_rpc.md) explains the binding and request envelope used by the later server/client examples.
 
 ## Quick start: prove the pinned SDK works
 
-Install the current repository baseline into an active Python 3.10+ environment:
+Install the repository's pinned teaching baseline into an active Python 3.10+ environment:
 
 ```bash
 python -m pip install "a2a-sdk==1.1.2"
@@ -29,7 +29,9 @@ If the import fails, `python -m pip --version` and `python --version` usually re
 
 `a2a-sdk` is the **official Python SDK** for the Agent2Agent (A2A) protocol, maintained at [`github.com/a2aproject/a2a-python`](https://github.com/a2aproject/a2a-python). It is async-first, requires **Python 3.10+** (tested through 3.14), and ships the protocol model as generated **Protocol Buffers** classes. These classes enforce the wire schema and field-presence rules; they are not ordinary Python data classes with arbitrary attributes.
 
-The checked baseline is **`1.1.2`** (released 2026-07-20). It implements wire protocol **1.0** and includes compatibility support for older 0.3 peers. Patch releases of the specification do not change the negotiated `Major.Minor` wire value.
+The examples use **`1.1.2`** (released 2026-07-20), verified for this collection on 2026-10-12. It implements wire protocol **1.0** and includes compatibility support for older 0.3 peers. It is a teaching pin, not the latest SDK: [1.2.2 was released in October 2026](https://github.com/a2aproject/a2a-python/releases). Patch releases of the specification do not change the negotiated `Major.Minor` wire value.
+
+For production, [1.1.4 fixed owner-scoped cancellation/subscription and push URL validation](https://github.com/a2aproject/a2a-python/releases). Upgrade beyond the 1.1.2 lesson pin before serving multiple tenants or accepting callback URLs, then execute the isolation and callback tests in the production notes.
 
 The SDK gives you three layers:
 
@@ -55,20 +57,20 @@ The SDK gives you three layers:
 The base package is enough to import `a2a.types` and use the in-memory client/server primitives:
 
 ```bash
-pip install a2a-sdk
+python -m pip install "a2a-sdk==1.1.2"
 ```
 
 Most real agents need at least the HTTP server bindings. Install extras with the bracket syntax:
 
 ```bash
 # HTTP server (Starlette / FastAPI route factories)
-pip install "a2a-sdk[http-server]"
+python -m pip install "a2a-sdk[http-server]==1.1.2"
 
 # Persistent task store on Postgres + telemetry
-pip install "a2a-sdk[postgresql,telemetry]"
+python -m pip install "a2a-sdk[postgresql,telemetry]==1.1.2"
 
 # Everything
-pip install "a2a-sdk[all]"
+python -m pip install "a2a-sdk[all]==1.1.2"
 ```
 
 ### 2.1 Optional extras
@@ -96,13 +98,13 @@ pip install "a2a-sdk[all]"
 ```bash
 # In a project directory
 uv init a2a-agent && cd a2a-agent
-uv add "a2a-sdk[http-server]"
+uv add "a2a-sdk[http-server]==1.1.2"
 
 # Or, ad hoc, into an existing venv
-uv pip install "a2a-sdk[http-server]"
+uv pip install "a2a-sdk[http-server]==1.1.2"
 ```
 
-💡 For a throwaway smoke test you don't even need a project: `uv run --with a2a-sdk python smoke_test.py`.
+💡 For a throwaway smoke test you don't even need a project: `uv run --with 'a2a-sdk==1.1.2' python smoke_test.py`. Commit the resulting lockfile for project examples so the resolved dependencies stay stable.
 
 ---
 
@@ -214,7 +216,8 @@ The SDK version and the spec version are **not** the same number — track both.
 
 | SDK version      | Spec implemented | Notes                                                  |
 |------------------|------------------|--------------------------------------------------------|
-| `1.1.x` (baseline `1.1.2`) | A2A protocol 1.0 | Current checked line; includes 0.3 compatibility and current handler shutdown behavior |
+| `1.2.x` (latest reviewed `1.2.2`) | A2A protocol 1.0 | New opt-in cluster mode, card cache/media-type behavior, SSE shutdown grace; run migration tests |
+| `1.1.x` (teaching baseline `1.1.2`) | A2A protocol 1.0 | Reproduced examples here; process-local active task registry and 0.3 compatibility |
 | `1.0.x` | A2A protocol 1.0 | Older stable SDK line; upgrade deliberately |
 | `0.3.x` and earlier    | A2A v0.3.x  | Pre-1.0. Different class names and module layout       |
 
@@ -225,6 +228,8 @@ Key points:
 - The `request_handlers` package keeps a `LegacyRequestHandler` for 0.3-style server semantics; `DefaultRequestHandler` is the v2 (1.0) handler.
 
 > **Rule**: Pin the SDK — `a2a-sdk==1.1.2`, not `a2a-sdk>=1.0`. Minor releases can change lifecycle behavior even when the wire protocol remains 1.0. Pin, read the changelog, run conformance checks, then upgrade deliberately.
+
+For a new multi-replica deployment, compare the [1.2.x opt-in cluster mode](https://github.com/a2aproject/a2a-python/releases) with the explicit worker architecture in [Scaling & Deployment](../05_production/03_scaling_deployment.md). During an upgrade, test card cache invalidation, HTTP+JSON's `application/a2a+json` handling, strict validation of advertised message media types when enabled, SSE shutdown, REST error bodies, and v0.3 conversion. Keep the 1.1.2 code and 1.2.x test environment separate until those checks pass.
 
 ⚠️ When following a blog post or tutorial, check its date and the SDK version it targets. An import like `from a2a.server.apps import A2AStarletteApplication` is a 0.x-era pattern; in `1.0.x` you compose routes with the `create_*_routes` factories instead.
 
@@ -244,3 +249,25 @@ The success signal is `http-server OK`. An `ImportError` that names an optional 
 ---
 
 **Next**: [Part 2: Building a Server](02_building_a_server.md)
+
+## Recap, check yourself, and try it
+
+- A pinned SDK version makes the next server and client examples reproducible; a wire version and an SDK version answer different compatibility questions.
+- The base install proves model imports. Optional extras supply transport or storage dependencies, and a feature-specific construction/import check proves that extra is available.
+- A lockfile prevents a teammate's resolver from silently selecting a newer minor release.
+
+**Q: `AgentCard` imports, but constructing `GrpcHandler()` raises an ImportError naming gRPC. Is the SDK installation broken?**
+
+<details><summary>Answer</summary>
+
+The model import only proves the base package. Install `a2a-sdk[grpc]==1.1.2`, then perform the gRPC feature check. The optional transport is a separate dependency.
+
+</details>
+
+**Try it:** change a project pinned to HTTP server support so it can also host gRPC. Start from `dependencies = ["a2a-sdk[http-server]==1.1.2", "uvicorn>=0.30"]`; replace only the SDK dependency and verify the resulting version and gRPC module import. Hint: extras share one bracket list.
+
+<details><summary>Worked solution</summary>
+
+Use `"a2a-sdk[http-server,grpc]==1.1.2"`, resolve and commit the lockfile, then run `python -c "from importlib.metadata import version; import grpc; print(version('a2a-sdk'), grpc.__version__)"`. The check proves the pinned package and gRPC dependency are present; a full handler construction test is still needed when you wire the server.
+
+</details>

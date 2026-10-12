@@ -4,7 +4,7 @@
 
 > **Who this is for**: Engineers taking an A2A agent from a single-process prototype to a horizontally-scaled production deployment. Before reading this, understand how a server is wired up: **[Building a Server](../03_python/02_building_a_server.md)**, and how streaming works on the wire: **[Streaming & Push](../02_protocol/04_streaming_and_push.md)**.
 
-The default `a2a-sdk` 1.1.2 server you build from the quickstart runs fine on one machine. The moment you put two replicas behind a load balancer, a pile of in-process assumptions break: Task state lives in one replica's RAM, a live Server-Sent Events (SSE) stream and its `SubscribeToTask` attempt may land on different replicas, and a 40-minute task is pinned to the lifetime of one HTTP request. This file is about fixing all of that.
+The teaching baseline is `a2a-sdk` 1.1.2. It is an architecture example, **not a recommended production pin**: 1.1.4 fixed owner-scoped cancel/subscribe and push URL validation, and 1.2.0 introduced cluster mode. Plan a tested upgrade before production. The default 1.1.2 server you build from the quickstart runs fine on one machine. The moment you put two replicas behind a load balancer, a pile of in-process assumptions break: Task state lives in one replica's RAM, a live Server-Sent Events (SSE) stream and its `SubscribeToTask` attempt may land on different replicas, and a 40-minute task is pinned to the lifetime of one HTTP request. This file is about fixing all of that.
 
 ---
 
@@ -141,6 +141,55 @@ SendMessage  ──▶  web tier: persist Task(state=TASK_STATE_SUBMITTED), enqu
 
 The worker should emit the same durable state changes an in-request executor would — `TASK_STATE_WORKING`, artifact updates, and exactly one terminal state. Because those updates are persisted through the shared `TaskStore`, progress is visible to `GetTask`; because push configs are shared, completion can be delivered by webhook. If you also need live SSE, publish the same events to your broker-backed streaming layer.
 
+### A crash and reclaim, step by step
+
+The lease is a deadline on *execution ownership*, not a statement that a Task row exists. Here `task-7` has an external invoice-posting step; its provider request uses idempotency key `tenant-A/agent-A/task-7/step-5`.
+
+```mermaid
+sequenceDiagram
+  participant W as Web tier
+  participant DB as jobs/tasks/outbox DB
+  participant A as Worker A
+  participant B as Worker B
+  W->>DB: transaction: task-7 SUBMITTED + job READY + outbox
+  A->>DB: claim task-7, epoch 1, lease until t=60
+  A->>DB: WORKING + checkpoint step-4
+  A-xDB: crashes before step-5 result
+  B->>DB: t=61 claim expired lease, epoch 2
+  DB-->>B: checkpoint step-4 + task-7
+  B->>DB: retry step-5 with same provider idempotency key
+  B->>DB: COMPLETED + push outbox in one transaction
+```
+
+At t=40, Worker B must not claim while A's lease is current. At t=61, B can claim but cannot assume step-5 never reached the provider: A may have crashed after sending it. B's claim increments a **fencing epoch** from 1 to 2. If A wakes after t=61, its epoch-1 checkpoint or completion transaction must affect zero rows and roll back; otherwise an expired worker can overwrite B's newer state. The stable provider key prevents a second invoice posting; the checkpoint identifies the last *durably confirmed* step. Event IDs and a uniqueness constraint keep replay from emitting duplicate status or push rows. If the provider lacks idempotency, stop for reconciliation instead of automatic replay.
+
+**Failure drill for an assembled deployment:** create a long-running `task-7`, verify `GetTask` reports `WORKING`, and record its owner, job ID, checkpoint, claim epoch, lease owner/deadline, event count, and outbox count. Kill the worker after checkpoint step-4 and before completion. Confirm another worker cannot claim before expiry, claims after expiry with a larger epoch, resumes from step-4, uses the same external idempotency key, and records exactly one terminal result and push intent. Also delay Worker A until after B reclaims and prove A's stale-epoch commit changes zero rows and emits no event. Reconnect through a different web replica and check the snapshot plus any broker-backed events for the same tenant/owner. This drill requires your actual worker, database, provider stub, and broker; the snippets in this note are design excerpts and do not themselves constitute a deployable application.
+
+### Run the bounded crash drill locally
+
+The [complete SQLite fixture](../examples/production/failover_fixture.py) executes the same sequence with two processes and a temporary database. Run it from the repository root with `python3 examples/production/failover_fixture.py`; it needs only the Python standard library. Worker A claims epoch 1, commits checkpoint 4, writes a provider-stub result under the stable step-5 key, and exits hard before recording completion. The controller proves B cannot claim at virtual t=40, then can at t=61 with epoch 2. A stale epoch-1 completion rolls back. B reuses the provider key, commits the terminal Task and one outbox row, and dispatches that row twice to an idempotent local receiver. The fixture asserts exactly one provider action, one outbox intent, and one delivery.
+
+Expected output:
+
+```text
+worker A killed after provider call; checkpoint=4
+t=40: B denied while lease current
+t=61: B reclaimed epoch=2, checkpoint=4
+stale A epoch=1 completion denied
+terminal task=COMPLETED; provider=1, outbox=1, delivery=1
+```
+
+This verifies transaction and fencing behavior on SQLite. Virtual time makes the lease boundary deterministic; it does not test clock skew. The local `deliveries` table models receiver deduplication, not a webhook or shared broker. Continue with the assembled deployment drill above for gateway routing, SDK TaskStore updates, broker replay, push authentication, and network failure recovery.
+
+| Symptom | Inspect | Recovery |
+|---|---|---|
+| `SUBMITTED` grows with no claims | READY jobs, dispatcher lag, worker health | Restore dispatch/worker, then retry unsent outbox rows |
+| Lease expired but no reclaim | claim predicate, database clock, worker poll loop | repair poller and reclaim; do not duplicate an uncertain external step |
+| Duplicate external action | provider idempotency key and reservation log | stop replay, reconcile provider state, then advance checkpoint |
+| Snapshot advances but stream stalls | event log/broker lag and proxy buffering | serve `GetTask`, repair event path, then allow resubscribe |
+
+Alert on oldest READY age, expired RUNNING lease count, outbox age, duplicate provider attempts, task terminal latency, and event replay lag. Drain worker claims before deploying a new worker version; maintain schema compatibility until old leases expire. Roll back the worker binary only while it can read current checkpoints and write the current schema.
+
 ### The durable acceptance/lease path
 
 A queue message alone is not ownership. Use one database transaction to create the submitted task, a durable job record, and an outbox row. A dispatcher publishes the outbox row and marks it sent. Workers claim jobs with a renewable lease and persist each state/event idempotently:
@@ -148,28 +197,70 @@ A queue message alone is not ownership. Use one database transaction to create t
 ```sql
 BEGIN;
 INSERT INTO tasks(owner, id, state, version) VALUES (:owner, :task, 'SUBMITTED', 1);
-INSERT INTO jobs(owner, task_id, message_id, state)
-VALUES (:owner, :task, :message, 'READY');
+INSERT INTO jobs(owner, task_id, message_id, state, claim_epoch)
+VALUES (:owner, :task, :message, 'READY', 0);
 INSERT INTO outbox(event_id, topic, payload)
 VALUES (:event_id, 'a2a.jobs', :job_payload);
 COMMIT;
 
 -- Worker claim; only one worker obtains the lease.
 UPDATE jobs SET state='RUNNING', lease_owner=:worker,
+                claim_epoch=claim_epoch + 1,
                 lease_until=NOW() + INTERVAL '60 seconds'
 WHERE owner=:owner AND task_id=:task
   AND state IN ('READY','RUNNING')
   AND (lease_until IS NULL OR lease_until < NOW())
 RETURNING *;
+
+-- Before writing checkpoint, Task status, or outbox, lock this job row.
+-- The application must ROLLBACK the entire transaction if zero rows return.
+BEGIN;
+UPDATE jobs SET checkpoint=:checkpoint
+WHERE owner=:owner AND task_id=:task
+  AND lease_owner=:worker AND claim_epoch=:claimed_epoch
+  AND lease_until > NOW() AND state='RUNNING'
+RETURNING claim_epoch;
+-- Only after one row returns: update Task and insert unique event/outbox rows.
+COMMIT;
 ```
 
-The web response is observable immediately: `GetTask` returns `SUBMITTED`. After a successful claim, the worker transaction changes it to `WORKING`; artifact/status events use a unique event ID so retries become no-ops; completion stores `COMPLETED` and a push-outbox row in the same transaction. If the worker crashes, its lease expires, another worker claims the durable job, loads the last checkpoint, and replays idempotently. If no checkpoint exists, restart from the beginning only when tools and writes have idempotency keys.
+The SQL is a design excerpt: provision a `claim_epoch` counter and checkpoint column before using it. The web response is observable immediately: `GetTask` returns `SUBMITTED`. After a successful claim, the worker transaction changes it to `WORKING`; artifact/status events use a unique event ID so retries become no-ops; completion stores `COMPLETED` and a push-outbox row in the same guarded transaction. A zero-row epoch guard aborts all Task and outbox writes. Because the guarded update holds the job row lock through commit, a competing reclaim cannot interleave a terminal write. If the worker crashes, its lease expires, another worker claims the durable job, loads the last checkpoint, and replays idempotently. If no checkpoint exists, restart from the beginning only when tools and writes have idempotency keys.
 
 Push notifications close the loop without the client holding a connection open: the client registers a webhook (`TaskPushNotificationConfig`), and the sender POSTs `StreamResponse` task/message/status/artifact updates. The protocol requires at least one delivery attempt per configured webhook; retry/backoff is optional at protocol level but should be a bounded production policy. See [Streaming & Push](../02_protocol/04_streaming_and_push.md) for the payload and authentication mechanics.
 
 ⚠️ Webhook delivery is a network call to an untrusted endpoint — it must be retried with backoff, time-limited, and authenticated (signed token / mTLS). Never let a slow webhook block a worker; dispatch it as its own job.
 
 ---
+
+### SDK 1.2.x cluster mode changes the choice
+
+The [1.2.0 release](https://github.com/a2aproject/a2a-python/releases/tag/v1.2.0) added opt-in multi-replica support: `VersionedDatabaseTaskStore` checks concurrent revisions, `DatabaseTaskEventStream` shares events, and `DefaultRequestHandlerV2(event_stream=...)` can serve resubscribe and cancel from another replica. It adds `task_versions` and `task_events` tables. The [merged design and sample](https://github.com/a2aproject/a2a-python/pull/1281) show the cross-replica behavior; [1.2.2](https://github.com/a2aproject/a2a-python/releases/tag/v1.2.2) is the newest checked release on 2026-10-12.
+
+| Need | 1.1.2 teaching baseline | 1.2.x cluster path |
+|---|---|---|
+| Read task snapshot on any replica | Shared `DatabaseTaskStore` | Versioned store |
+| Continue SSE after reconnect to another replica | Separate broker/event path | Shared `TaskEventStream` |
+| Concurrent cancel/update | Application coordination | Revision check in versioned store |
+| Survive worker-process death during an external action | Durable job, lease, checkpoint, idempotency still required | Same application requirement; cluster event replay alone cannot safely repeat a side effect |
+
+**Upgrade gate:** apply the cluster migrations in a staged environment, switch one isolated agent to the versioned store/event stream, run cross-replica send/get/subscribe/cancel and the crash drill above, then compare task/event counts and owner denials. Preserve old schema and binaries until mixed-version behavior is tested. The following local smoke test uses the [official SDK 1.2.2 cluster sample](https://github.com/a2aproject/a2a-python/tree/v1.2.2/samples/clustermode) in a separate checkout. It needs Python 3.12 and `uv`:
+
+```bash
+git clone --depth 1 --branch v1.2.2 https://github.com/a2aproject/a2a-python a2a-python-1.2.2
+cd a2a-python-1.2.2
+uv venv --python 3.12
+uv pip install --python .venv/bin/python 'a2a-sdk[http-server,sqlite]==1.2.2' fastapi uvicorn
+```
+
+In one shell, start the three replicas. In a second shell in the same checkout, run the exercise. The cluster process keeps running until you stop it with Ctrl+C.
+
+```bash
+./.venv/bin/python -m samples.clustermode.run_cluster --replicas 3 --base-port 41241
+# In another shell, from that same checkout:
+./.venv/bin/python -m samples.clustermode.exercise --host 127.0.0.1 --ports 41241,41242,41243
+```
+
+On 2026-10-12, this exact exercise exited 0: it started a Task on replica 0, read `TASK_STATE_WORKING` on replica 1, canceled through replica 2, and read `TASK_STATE_CANCELED` again on replica 0. That proves the sample's cross-replica Task visibility and cancellation with one shared SQLite file on one host. It does not prove a remote database, multi-host network failure, tenant isolation, push delivery, or your application's worker failover. A production upgrade still needs the owner and failure drill for your own tools and stores.
 
 ## 4. Deployment
 
@@ -383,6 +474,37 @@ async def lifespan(app):
 | Resilience | Graceful shutdown drains in-flight tasks, flushes telemetry | ☐ |
 
 > **Key insight**: Shared snapshots make tasks visible across replicas; they do not make execution durable. A disposable web tier needs owner-scoped state plus a durable job, lease, checkpoint, idempotent event log, and shutdown contract before a task can safely survive failover.
+
+## Retain the failover model
+
+- A shared TaskStore makes snapshots readable from any replica; a shared event stream or broker supplies reconnectable events.
+- A Task row does not transfer work. A durable job, lease, checkpoint, and idempotent side-effect contract do.
+- A crashed worker may have sent a request without recording its result, so reclaim must reuse an idempotency key or reconcile.
+- Cluster mode in SDK 1.2.x addresses cross-replica task revisions and events; the application still owns external side-effect recovery.
+
+**Q:** A client reconnects to Replica B while the 1.1.2 live queue remains on A. What can B return from shared storage?
+
+<details><summary>Answer</summary>
+
+B can return the persisted Task snapshot through `GetTask`. It cannot replay A's process-local queue through `SubscribeToTask` without a shared event path.
+
+</details>
+
+**Q:** A died after posting an invoice but before saving step-5. What should B do at lease expiry?
+
+<details><summary>Answer</summary>
+
+B resumes from the durable step-4 checkpoint and uses the *same* provider idempotency key for step-5. If the provider cannot deduplicate, B must reconcile the uncertain result before issuing another post.
+
+</details>
+
+**Try it:** Extend the failure drill for a push webhook. Which records should be written with `COMPLETED`, and what unique key prevents two notifications after reclaim?
+
+<details><summary>Worked answer</summary>
+
+Write the terminal Task transition, terminal event, and push outbox intent in one database transaction. Give the intent a stable event ID unique per task/terminal transition; the dispatcher may retry delivery but must not create a second intent on worker replay. The webhook receiver should also deduplicate that event ID.
+
+</details>
 
 ---
 

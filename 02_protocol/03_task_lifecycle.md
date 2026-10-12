@@ -236,7 +236,7 @@ The client's job:
 
 > **Rule**: Treat `auth-required` as non-terminal, but do not copy the input-required resume carrier. Credentials remain out of band unless a specific in-band authorization extension was negotiated.
 
-⚠️ Never put long-lived secrets in a message `part`. Credentials belong in transport headers or the agent's declared auth scheme. The `auth-required` state tells you authentication is needed; it does not invite you to paste a token into chat text.
+⚠️ Never put downstream credentials in a message `part`. Complete the negotiated external OAuth, secret-broker, or other authorization flow. The ordinary A2A `Authorization` header authenticates the caller to the agent; it is not a carrier for a downstream provider token. The `auth-required` state does not invite a token in chat text.
 
 ---
 
@@ -275,7 +275,7 @@ The lifecycle is small, but clients break it in predictable ways.
 
 ❌ **Treating a non-terminal state as terminal.** A client sees anything other than `TASK_STATE_WORKING` and assumes "done," then renders `TASK_STATE_INPUT_REQUIRED` as a final answer. The Task silently stalls because nobody answers the agent. *Fix*: branch on the three categories — Active, Interrupted, Terminal — never on a binary.
 
-❌ **Not handling `input-required` (or `auth-required`) at all.** The client polls until it sees something "not working," gives up, and the paused Task expires server-side. *Fix*: when you see an interrupted state, read `status.message` and send a continuation Message.
+❌ **Not handling an interrupted state.** The client polls until it sees something "not working," gives up, and the paused Task expires server-side. *Fix*: read `status.message`. For `input-required`, answer with a continuation Message carrying the existing `taskId`. For `auth-required`, complete the negotiated authorization flow out of band and observe the same Task; do not send credentials in a Message.
 
 ❌ **Supplying a mismatched `contextId`.** A continuation with `taskId: "task-7f3a9c21"` and a different context must be rejected. Omitting `contextId` is valid when `taskId` is present because the server infers it. *Fix*: persist both when practical, but never invent or replace the context on a continuation.
 
@@ -284,6 +284,45 @@ The lifecycle is small, but clients break it in predictable ways.
 ⚠️ **Polling forever on `TASK_STATE_UNSPECIFIED`.** `TASK_STATE_UNSPECIFIED` is not terminal and not actionable. If `GetTask` keeps returning it, that is an operational problem (agent restarted, lost state). Cap retries and escalate — do not poll indefinitely.
 
 > **Key insight**: Most lifecycle bugs are the same bug — the client collapsed the three-bucket model into two. Model Active, Interrupted, and Terminal explicitly, persist `taskId` + `contextId` for every open Task, and re-read state after every `cancel`.
+
+## What's changing
+
+The [A2A roadmap](https://github.com/a2aproject/A2A/blob/main/docs/roadmap.md) (checked 2026-10-12) labels task timelines, event filtering, messages during a working state, and structured elicitation as planned work. Treat them as proposals; this lesson's 1.0 state machine and continuation rules remain the baseline until a released version specifies otherwise.
+
+## Recap and check yourself
+
+- A `Message` can finish an exchange directly or create a server-owned `Task`; the client follows the returned type.
+- `taskId` selects the waiting work; `contextId` groups related conversation. A reply with only the latter can start new work.
+- Interrupted states need different actions: send content for `INPUT_REQUIRED`, complete the negotiated external flow for `AUTH_REQUIRED`, then observe the same Task.
+- Terminal states cannot resume. A cancel request races with completion, so read the resulting state.
+
+**Q: The agent pauses `task-7f3a9c21` for input. A reply carries `ctx-4b8e` but no `taskId`. Which Task receives it?**
+
+<details><summary>Answer</summary>
+
+The waiting Task is not identified and remains paused. The context groups conversation, but only `taskId` selects the Task to continue; the server may create new work for the reply.
+
+</details>
+
+**Q: A user finishes an external OAuth grant while the Task is `TASK_STATE_AUTH_REQUIRED`. What should the client send in an A2A text Part?**
+
+<details><summary>Answer</summary>
+
+No credential. The negotiated external channel delivers the grant; the client then observes the existing Task by stream, push, or `GetTask`. Only a separately specified application need would justify a follow-up Message.
+
+</details>
+
+**Try it.** The agent asks which quarter to use for `task-7f3a9c21` in `ctx-4b8e`. Complete the continuation Message from the earlier request, retaining its task identity and supplying `Q2`. Hint: `referenceTaskIds` links a *new* Task, not this one.
+
+<details><summary>Worked solution</summary>
+
+```json
+{"messageId":"msg-q2-answer-1","role":"ROLE_USER","taskId":"task-7f3a9c21","contextId":"ctx-4b8e","parts":[{"text":"Q2"}]}
+```
+
+The existing `taskId` directs this Message to the paused work. A fresh `messageId` identifies this client message; the original context remains consistent.
+
+</details>
 
 ---
 

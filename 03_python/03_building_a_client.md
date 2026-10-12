@@ -277,6 +277,24 @@ async for event in client.send_message(request=request):
 
 When the agent advertises `capabilities.streaming` and your `ClientConfig.streaming=True`, `send_message()` yields events live as the agent produces them. You consume the same `StreamResponse` `oneof`, plus the two update events.
 
+The report request below shows who owns each ID as the stream pauses and resumes. The follow-up is a new Message on the existing Task; a broken SSE connection instead calls `SubscribeToTask` with the captured Task ID.
+
+```mermaid
+sequenceDiagram
+  participant C as Python client
+  participant A as A2A server
+  participant T as Task store
+  C->>A: SendMessage(messageId=m1, "Generate report")
+  A->>T: create task t1 in context c1
+  A-->>C: Task(t1,c1), WORKING, artifact chunk
+  A-->>C: INPUT_REQUIRED(t1,c1)
+  C->>A: SendMessage(messageId=m2, taskId=t1, contextId=c1)
+  A->>T: resume t1
+  A-->>C: COMPLETED(t1,c1) + report Artifact
+```
+
+The client saves `t1` and `c1` from the server's first response. At `INPUT_REQUIRED`, new user content belongs in `m2`, with both IDs echoed; the store can then continue `t1`. If SSE drops while the Task is still working, `subscribe(t1)` observes existing work without creating a second Task. If the client never received `t1`, it cannot safely assume a retry is idempotent.
+
 ```python
 from dataclasses import dataclass
 
@@ -671,3 +689,26 @@ if __name__ == "__main__":
 ---
 
 **Next**: [Part 1: LangChain & LangGraph](../04_frameworks/01_langchain_langgraph.md)
+
+## Recap, check yourself, and try it
+
+- Resolve the card, select a compatible transport, then inspect the response oneof before reading Message or Task fields.
+- Save the server-issued `task_id` and `context_id`. A follow-up input Message echoes both; a reconnect subscribes to the existing Task ID.
+- A drop before Task identity is known leaves the result indeterminate unless the server promises durable deduplication.
+- Bound waits and close the client so network failures and resources have explicit ends.
+
+**Q: SSE drops after the client records `task_id=t1`, before completion. Should it resend `m1`?**
+
+<details><summary>Answer</summary>
+
+No. Resending may create another Task. Call `subscribe(SubscribeToTaskRequest(id="t1"))` and reconcile the returned Task/events; use `GetTask` if the stream cannot be restored.
+
+</details>
+
+**Try it:** in the reconnect excerpt above, replace `...` with handling that prints the terminal Task state while retaining the captured ID. Hint: use `event.HasField("task")` and `TaskState.Name` as in the opening client.
+
+<details><summary>Worked solution</summary>
+
+Inside the subscription loop, use `if event.HasField("task"): print(TaskState.Name(event.task.status.state))` and also inspect `status_update` events for a terminal state. Keep `progress.task_id` across the exception. This observes `t1`; it does not call `send_message` again.
+
+</details>

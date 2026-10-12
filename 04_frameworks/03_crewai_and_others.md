@@ -18,6 +18,8 @@ This file covers the *rest* of the agent-framework ecosystem. The mechanics of `
 
 If you have not selected a framework, compare operational needs first: explicit control favors the SDK adapter; native integration favors less glue but couples you to the framework's release cadence. Stop after your chosen branch and [the shared gotchas](#6-shared-gotchas).
 
+**Decision exercise:** Your existing Crew coordinates three agents and must return a binary image artifact. Which branch owns the A2A boundary? The explicit Crew executor does: it can run the whole Crew and construct the binary artifact. The native single-Agent config attaches to one Agent, so it does not by itself express that result mapping.
+
 ### Integration state (checked August 2026)
 
 | Framework | Server support | Client support |
@@ -147,6 +149,8 @@ class ResearchCrewExecutor(AgentExecutor):
 ```
 
 Wire it into a server exactly as in the prerequisite (`DefaultRequestHandler` + the `create_jsonrpc_routes` / `create_agent_card_routes` factories on a Starlette app); the only CrewAI-specific part is the executor body.
+
+This block is an **executor excerpt**: it needs a CrewAI installation, a configured model, and the prerequisite's complete server wiring. Its intended first result is one Task, an artifact named `research_<task id>` containing the Crew answer, then `TASK_STATE_COMPLETED`. A card fetch checks exposure only; it does not prove that `kickoff_async()` ran or that the result reached an artifact. Run the prerequisite's `SendMessage` request against the assembled app and inspect both fields before calling it verified.
 
 ✅ The native shortcut: instead of the executor above, recent CrewAI lets you pass `A2AServerConfig` directly to an `Agent` (`Agent(..., a2a=A2AServerConfig(name="Research Analyst", protocol_version="1.0"))`) and CrewAI builds the A2A surface for you. Use the hand-written executor when you need a *multi-agent Crew* exposed as one A2A endpoint, since the native config attaches to a single `Agent`.
 
@@ -292,6 +296,8 @@ class LlamaIndexWorkflowExecutor(AgentExecutor):
 
 LlamaIndex `Workflow` event streaming maps almost 1:1 onto A2A's incremental `Task` events — each `LogEvent`/custom event becomes a `TaskStatusUpdateEvent`, and the final result becomes an artifact. To consume a remote A2A agent inside LlamaIndex, wrap the `a2a-sdk` client call in a `FunctionTool` and hand it to an `AgentWorkflow` / `FunctionAgent`.
 
+For both this branch and the Semantic Kernel excerpt, the omitted `_status_update`/`_completed` functions are real adapter work, not built-in functions. Use `TaskUpdater` from the prerequisite and test a working update followed by exactly one artifact and a final state. The local [adapter contract fixture](../examples/frameworks/adapter_contract.py) exercises that expected state sequence without loading either framework; it does not establish their API compatibility.
+
 ⚠️ Workflows are async-native, but `Workflow.run()` returns a *handler* — you must `await` it (or stream it) inside `execute`; forgetting to await silently drops the result.
 
 ---
@@ -373,5 +379,54 @@ AG2 demonstrates the agent-as-a-service pattern: the remote agent's tools, envir
 💡 **When in doubt, hand-write the executor.** Native configs attach to a single agent and assume a simple request/response. For multi-agent Crews, branching Workflows, or custom artifact types, the explicit `AgentExecutor` from [Building a Server](../03_python/02_building_a_server.md) is more predictable than fighting a framework's abstraction.
 
 ---
+
+
+## Apply the boundary to a changed request
+
+All four branches must make the same A2A promise: a discoverable card, a `SendMessage` that yields either a Message or Task, and a result that agrees with the card's declared modes and capabilities. The framework's internal events are not A2A events until a native or explicit adapter projects them. A long-running branch adds a second promise: save the framework's pending state and A2A Task identity, expose `INPUT_REQUIRED`, and resume the same Task after reconnect. The local fixture models the state projection and rejects a changed identity; actual framework packages and endpoints still need their own integration runs.
+
+```mermaid
+sequenceDiagram
+  participant C as A2A client
+  participant A as framework adapter
+  participant F as framework run
+  participant S as shared task/checkpoint store
+  C->>A: SendMessage task-7, ctx-7
+  A->>F: start run with ctx-7
+  F-->>A: pending ticket-9
+  A->>S: save task-7 and pending state
+  A-->>C: task-7 INPUT_REQUIRED
+  C->>A: reconnect task-7, ctx-7, yes
+  A->>S: load task-7 and pending state
+  A->>F: resume ticket-9 with yes
+  F-->>A: approved result
+  A-->>C: artifact approved, COMPLETED
+```
+
+If the framework supports only one-shot responses, its branch stops before the pause; do not advertise long-running continuation. If it does pause, an A2A `INPUT_REQUIRED` update alone is insufficient: the second adapter process needs the framework checkpoint and Task record. The second request's IDs must select those saved records, and the adapter must publish one final result after the framework resumes.
+
+**Q: The Crew returns an answer, but the executor emits an artifact without `complete()`. What does the client observe?**
+
+<details><summary>Answer</summary>
+
+It may see the artifact but still wait for a terminal Task state. The executor must emit `TASK_STATE_COMPLETED` after the artifact, or a failed state if execution failed.
+
+</details>
+
+**Q: An AG2 client reconnects after a pause, but the server has only a process-local Task store. Can the client setting alone recover the run?**
+
+<details><summary>Answer</summary>
+
+No. Reconnect options can retry transport, but another replica needs a shared Task record and framework state. The server must supply those stores and validate that the continuation uses the original identity.
+
+</details>
+
+**Try it:** Extend the Crew executor for a framework result that says `pending ticket-9`. Identify the missing step before sending `INPUT_REQUIRED`. Hint: another process must later find both the Task and the Crew's pending work.
+
+<details><summary>Worked solution</summary>
+
+Persist `ticket-9` and the Crew checkpoint keyed by `ctx-7` alongside `task-7`, then emit an `INPUT_REQUIRED` status. A continuation must load both records and resume the pending work before adding an artifact and completing. The displayed Crew excerpt has no resumable Crew checkpoint, so it cannot implement this path by merely changing the status call; build or select a durable workflow first.
+
+</details>
 
 **Next**: [Part 1: Authentication](../05_production/01_authentication.md)

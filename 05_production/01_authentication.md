@@ -259,7 +259,7 @@ When the issuer promises a JWT access-token profile, the server validates that J
 | `aud`       | Matches *this* agent's identifier                           | **Token confusion** — see §8                |
 | `exp`       | Token is not expired (also `nbf` if present)                | Stolen tokens are valid forever             |
 
-### Production-grade FastAPI bearer-JWT dependency
+### Bearer-JWT validation at the FastAPI boundary
 
 This dependency validates an inbound JWT and returns the authenticated identity plus scopes. It fetches signing keys via JWKS with caching, so it does not hit the IdP on every request.
 
@@ -338,21 +338,95 @@ def require_scope(scope: str):
     return _gate
 ```
 
-Mount it so it guards the A2A endpoint, then carry the verified principal into the SDK-facing adapter:
+### Pass that principal through the SDK route
+
+SDK **1.2.2** uses `create_jsonrpc_routes(..., context_builder=...)`. The builder's `build(request)` method is synchronous, so validate the bearer token and membership in asynchronous ingress middleware first. This assembly reuses `authenticated_principal` above and the `handler`/`card` pattern from [Building a Server](../03_python/02_building_a_server.md), rebuilt under SDK 1.2.2. Set that card's JSON-RPC interface URL to `https://your-host/invoice/a2a` to match the route below; the echo card's `/` URL cannot be reused. The membership map is a small teaching fixture; a deployed service reads memberships from trusted storage and tests revocation. Install `a2a-sdk[http-server]==1.2.2`, `fastapi`, and `PyJWT[crypto]` for these imports. [Route source](https://github.com/a2aproject/a2a-python/blob/v1.2.2/src/a2a/server/routes/jsonrpc_routes.py), [default builder](https://github.com/a2aproject/a2a-python/blob/v1.2.2/src/a2a/server/routes/common.py).
 
 ```python
-@app.post("/invoice/a2a")
-async def a2a_endpoint(
-    request: Request,
-    principal: Principal = Depends(require_scope("tasks:write")),
-):
-    # This adapter is application code: it copies the principal into the
-    # ServerCallContext used by the handler/store. Never re-read an unverified header.
-    call_context = server_context_from_http(request, owner_id=principal.subject)
-    return await dispatch_a2a(request, a2a_request_handler, call_context)
+from fastapi.security import HTTPAuthorizationCredentials
+from contextlib import asynccontextmanager
+from starlette.applications import Starlette
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+from a2a.auth.user import User
+from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
+from a2a.server.routes.common import DefaultServerCallContextBuilder
+
+MEMBERSHIPS = {"agent-A": {"tenant-A"}, "agent-B": {"tenant-B"}}
+METHOD_SCOPES = {
+    "SendMessage": "tasks:write", "SendStreamingMessage": "tasks:write",
+    "CancelTask": "tasks:write", "CreateTaskPushNotificationConfig": "tasks:write",
+    "DeleteTaskPushNotificationConfig": "tasks:write",
+    "GetTask": "tasks:read", "ListTasks": "tasks:read",
+    "SubscribeToTask": "tasks:read",
+    "GetTaskPushNotificationConfig": "tasks:read",
+    "ListTaskPushNotificationConfigs": "tasks:read",
+    "GetExtendedAgentCard": "tasks:read",
+}
+
+class ScopedUser(User):
+    def __init__(self, key: str): self.key = key
+    @property
+    def is_authenticated(self) -> bool: return True
+    @property
+    def user_name(self) -> str: return self.key
+
+class VerifiedIngress(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        if request.url.path != "/invoice/a2a":
+            return await call_next(request)  # public Agent Card
+        scheme, _, token = request.headers.get("authorization", "").partition(" ")
+        if scheme.lower() != "bearer" or not token:
+            return JSONResponse({"error": "unauthorized"}, status_code=401,
+                                headers={"WWW-Authenticate": "Bearer"})
+        try:
+            principal = await authenticated_principal(
+                request, HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+            )
+        except HTTPException as exc:
+            return JSONResponse({"error": exc.detail}, status_code=exc.status_code,
+                                headers=exc.headers)
+        try:
+            method = (await request.json())["method"]
+        except (ValueError, KeyError, TypeError):
+            return JSONResponse({"error": "invalid request"}, status_code=400)
+        required = METHOD_SCOPES.get(method)
+        if required is None:
+            return JSONResponse({"error": "unsupported method"}, status_code=400)
+        if required not in principal.scopes:
+            return JSONResponse({"error": "insufficient scope"}, status_code=403)
+        requested = request.headers.get("x-tenant", "")
+        if requested not in MEMBERSHIPS.get(principal.subject, set()):
+            return JSONResponse({"error": "tenant forbidden"}, status_code=403)
+        request.state.verified_identity = (requested, principal.subject, principal.scopes)
+        return await call_next(request)
+
+class VerifiedContextBuilder(DefaultServerCallContextBuilder):
+    def build(self, request):
+        tenant, subject, scopes = request.state.verified_identity
+        context = super().build(request)  # keeps A2A-Version and extension headers
+        context.user = ScopedUser(f"{tenant}\x1f{subject}")
+        context.tenant = tenant
+        context.state["scopes"] = scopes
+        context.state["headers"].pop("authorization", None)
+        return context
+
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    await handler.aclose()
+
+app = Starlette(routes=[
+    *create_agent_card_routes(card),
+    *create_jsonrpc_routes(handler, rpc_url="/invoice/a2a",
+                           context_builder=VerifiedContextBuilder()),
+], lifespan=lifespan)
+app.add_middleware(VerifiedIngress)
 ```
 
-`server_context_from_http` and `dispatch_a2a` are deliberate application-boundary functions, not SDK helpers: their contract is to preserve the already-verified `owner_id` through every task-store and executor call.
+The route factory calls the builder and passes its result to the real SDK handler. The default builder preserves `A2A-Version`; constructing only `ServerCallContext(user=...)` would accidentally make a 1.0 call look like legacy 0.3. The owner key combines trusted tenant and subject, which the SDK's `resolve_user_scope` reads from `context.user.user_name`. The method map is an application policy for this card; update and test it whenever a binding or method is added. This block is an integration excerpt because `handler`, `card`, and production membership storage come from the application; the linked route fixture below is complete and executable. [Multi-Tenant Scoping](04_multi_tenant_scoping.md) develops the row predicate.
+
+Run the [two-principal route fixture](../examples/production/auth_route_fixture.py) with `a2a-sdk[http-server]==1.2.2`. It uses local test tokens to isolate the route-to-handler handoff from JWT network setup, starts a Beta task, and proves Acme gets task-not-found for live `GetTask`, `CancelTask`, `SubscribeToTask`, and push-config read. The fixture is local evidence for SDK context propagation, not a test of your issuer, database, broker, or callback delivery.
 
 OIDC discovery supplies issuer metadata such as `jwks_uri` and `token_endpoint`; it does not dictate access-token format. Validate JWT access tokens only when the issuer documents that profile. Otherwise call the issuer's authenticated introspection endpoint and enforce `active`, issuer/audience/resource, subject, expiry, and scopes.
 
@@ -472,6 +546,37 @@ Each of these has shipped to production somewhere. Audit your deployment against
 | **One OAuth client shared across the fleet** | All agents share an identity — no per-agent allow-listing, no audit attribution, huge blast radius on leak | One OAuth client (and minimal scope set) per agent |
 
 > **Key insight**: Authentication establishes a principal; it does not authorize a resource. Carry the verified owner/tenant identity into every task and push-configuration query, including reads and subscriptions, and return the same not-found result for missing and inaccessible IDs.
+
+## Retain the authorization chain
+
+- The card advertises acceptable schemes; credentials travel in HTTP or transport metadata, never in an A2A `Message`.
+- JWT signature, issuer, audience, and expiry establish a principal. A valid token for another audience still fails before an A2A handler runs.
+- Scopes permit operation types; a verified tenant/owner predicate decides which Task is accessible.
+- Ingress validation has no effect on SDK storage unless the transport adapter carries that principal into `ServerCallContext`.
+
+**Q:** A JWT has a valid signature and `tasks:read`, but its `aud` names a different agent. Does `GetTask` run?
+
+<details><summary>Answer</summary>
+
+No. This agent is not the token's intended receiver. The audience check fails at ingress before scope or row ownership checks.
+
+</details>
+
+**Q:** The FastAPI dependency succeeds, but `DatabaseTaskStore` sees an unauthenticated user. What boundary is missing?
+
+<details><summary>Answer</summary>
+
+The HTTP-to-SDK adapter did not put the verified principal into the `ServerCallContext` passed to the handler. A successful dependency only validates the route; it does not change SDK context by itself.
+
+</details>
+
+**Try it:** Adapt a `tasks:read` endpoint for a caller belonging to `tenant-A`. After JWT validation, what should `ServerCallContext.user.user_name` contain before `GetTask`? Use the construction in [Multi-Tenant Scoping](04_multi_tenant_scoping.md) as a hint.
+
+<details><summary>Worked answer</summary>
+
+It should contain a canonical key derived from the verified membership pair, such as `tenant-A\x1fagent-A`. The adapter must pass that context into the handler. The store's owner resolver then applies the same key on `GetTask`, so a guessed task from another tenant yields no row.
+
+</details>
 
 ---
 

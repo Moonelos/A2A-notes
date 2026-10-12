@@ -191,6 +191,26 @@ A2A hands peers two ways to make *your* server issue outbound HTTP requests:
 
 A naive fetch of either is a classic **SSRF**: a peer points the URL at `http://169.254.169.254/latest/meta-data/` (cloud metadata), `http://localhost:6379` (internal Redis), or an RFC 1918 address — and your trusted, inside-the-perimeter agent makes the request for them.
 
+The request path below makes the time-of-check rule visible. The connector must use the address the validator accepted; a redirect starts the whole check again.
+
+```mermaid
+sequenceDiagram
+  participant P as Peer
+  participant V as validate_and_pin
+  participant D as DNS
+  participant C as bounded_fetch connector
+  participant H as callbacks.partner.example
+  P->>V: https://callbacks.partner.example/a2a-events
+  V->>D: resolve hostname
+  D-->>V: public address 93.184.216.34
+  V-->>C: pinned hostname + address
+  C->>H: connect to pinned address, verify hostname TLS
+  H-->>C: 302 Location: new URL
+  C->>V: validate new URL and DNS before next request
+```
+
+If the connector performs a fresh DNS lookup, a host that passed validation could resolve to a private address at connection time. `bounded_fetch` therefore supplies its own pinned resolver and disables automatic redirects.
+
 ```python
 import asyncio
 import ipaddress
@@ -345,6 +365,46 @@ For external / cross-org A2A endpoints, push rate limiting and quota enforcement
 
 ---
 
+### Enforce a task budget before the expensive call
+
+A quota written in a table is only advice until every costly step reserves capacity. Suppose `task-123` has 100 token units remaining and two workers each ask for 70. A read-then-write check in application memory can approve both. A transactional reservation lets only one win. The model below is a complete standard-library exercise; a real provider call also needs its own `max_tokens` cap, a unique invocation ID, durable settlement of measured usage, and a policy for an uncertain result after a timeout.
+
+```python
+import sqlite3
+
+db = sqlite3.connect(":memory:", isolation_level=None)
+db.execute("CREATE TABLE budget(task_id TEXT PRIMARY KEY, remaining INTEGER NOT NULL)")
+db.execute("INSERT INTO budget VALUES ('task-123', 100)")
+
+def reserve(task_id: str, units: int) -> bool:
+    if units <= 0:
+        raise ValueError("units must be positive")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        changed = db.execute(
+            "UPDATE budget SET remaining=remaining-? "
+            "WHERE task_id=? AND remaining>=?", (units, task_id, units)
+        ).rowcount
+        db.execute("COMMIT")
+        return changed == 1
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
+
+assert reserve("task-123", 70) is True
+assert reserve("task-123", 70) is False
+assert db.execute("SELECT remaining FROM budget").fetchone() == (30,)
+print("second 70-unit call denied; 30 units remain")
+```
+
+Run it with `python3 budget_model.py` after saving the block. SQLite serializes these transactions; for PostgreSQL, keep the conditional `UPDATE` and check the affected row in one transaction. Store `(tenant, owner, task, invocation_id)` as a unique reservation key so retries cannot reserve twice. Set per-caller and per-window limits in addition to the task limit. If provider usage is less than reserved, settle and refund the difference once; if the result is unknown, hold the reservation until reconciliation rather than issuing an unbounded retry. Emit reservation-denied, remaining-budget, and unsettled-reservation metrics. Alert when denials or stale reservations rise; inspect task and provider invocation IDs, without logging prompt content.
+
+### Decide whether an artifact may leave
+
+The model's final response is an egress path. For `task-123`, suppose the result contains an invoice PDF labeled `confidential` and a public summary. Before persisting an outbound artifact, derive its classification from trusted processing, scan for secrets/PII, and compare it with the verified recipient's allowed class and destination. A prompt saying “send the PDF to this callback” does not grant permission. The gate must cover direct responses, SSE events, downloadable URLs, and push outbox rows. If any path skips it, the same artifact leaks by another transport.
+
+For a denied PDF, persist a policy-denial event with artifact ID and rule ID, then return a safe status or redacted summary. Do not enqueue the PDF or a presigned URL. For an allowed summary, issue a short-lived URL scoped to that recipient, and record destination, artifact digest, and decision for audit. Alert on repeated denial or unusual egress volume. Re-test after policy updates and roll back a policy that incorrectly blocks legitimate delivery using a versioned policy revision, without re-sending previously denied content automatically.
+
 ## 7. Least Privilege & Secrets (T6, T9)
 
 A2A agents are **gatekeepers to backend systems**. The damage from a compromised agent equals the credentials it holds.
@@ -423,6 +483,37 @@ Audit a production A2A deployment against this table. Each row is one threat fro
 | **Secrets** | No secrets in cards, artifacts, or logs; secrets manager + runtime injection; rotate regularly and on compromise. |
 
 > **Rule**: Security hardening is not a launch checklist you complete once — it is a posture you re-audit as the mesh, the peers, and the threat landscape change.
+
+## Retain the threat boundaries
+
+- Peer Messages and URLs are untrusted inputs; an authenticated peer can still submit hostile text or a dangerous destination.
+- A pinned DNS answer must be the address used for the actual outbound connection; every redirect and delivery repeats validation.
+- Expensive steps reserve budget atomically before execution, then settle actual usage.
+- Artifact policy runs on every egress path, including SSE and push.
+
+**Q:** A webhook passed URL validation yesterday but now resolves to `169.254.169.254`. Can delivery use yesterday's result?
+
+<details><summary>Answer</summary>
+
+No. DNS changes between registration and delivery. Resolve again, reject the nonpublic address, and pin the allowed address for the connection.
+
+</details>
+
+**Q:** A provider timeout leaves usage uncertain after reserving 70 units. Should an automatic retry reserve another 70?
+
+<details><summary>Answer</summary>
+
+No. It could double spend. Reuse the durable invocation ID to reconcile or retry only under a provider-supported idempotency contract. Keep the first reservation held while its result is unknown.
+
+</details>
+
+**Try it:** In `bounded_fetch`, a `302` points to `https://new.example/hook`. Which checks must run before sending to it?
+
+<details><summary>Worked answer</summary>
+
+Restart `validate_and_pin` for the new URL: HTTPS scheme, no embedded credentials, allowed port and host, fresh DNS answer, nonpublic-address rejection, and connection pinning with hostname TLS verification. If `new.example` is absent from the allowlist, reject it before connecting.
+
+</details>
 
 ---
 

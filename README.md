@@ -2,6 +2,10 @@
 
 > A practical, implementation-focused guide to the Agent2Agent (A2A) protocol — from core concepts to production-grade multi-agent systems.
 
+**Audience:** developers comfortable with basic Python, HTTP, JSON, and command-line use; no prior A2A knowledge is assumed. Framework branches assume the chosen framework. The notes teach A2A wire protocol 1.0 (specification patch 1.0.1) and pin Python SDK 1.1.2 for reproducible examples. The SDK pin is historical as of 2026-10-12; newer 1.2.x behavior is covered as upgrade context. AP2 payment mandate details are outside this A2A learning path.
+
+**Production version gate:** [SDK 1.1.4 fixed owner-scoped cancel/subscribe and push callback URL validation](https://github.com/a2aproject/a2a-python/releases). Do not deploy the 1.1.2 teaching pin unchanged for multi-tenant or callback-enabled production; upgrade and rerun the isolation and callback tests in the production path.
+
 [![A2A](https://img.shields.io/badge/A2A-wire_1.0_%7C_spec_1.0.1-4285F4.svg?logo=googlecloud&logoColor=white)](https://a2a-protocol.org/latest/specification/)
 [![a2a-sdk](https://img.shields.io/badge/a2a--sdk-1.1.2-3776AB.svg?logo=python&logoColor=white)](https://pypi.org/project/a2a-sdk/)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
@@ -153,3 +157,20 @@ After the agent is exposed, use [Core Concepts](01_fundamentals/02_core_concepts
 4. [Security Hardening](05_production/02_security_hardening.md) and [Multi-Tenant Scoping](05_production/04_multi_tenant_scoping.md) — secure single-replica milestone
 5. [Scaling & Deployment](05_production/03_scaling_deployment.md) — continue for multiple replicas, durable jobs, or operational SLOs
 6. [Conformance & Interoperability](05_production/05_conformance_and_interoperability.md) — release gate every advertised binding
+
+The production notes include executable local proofs for owner-scoped JSON-RPC access, worker crash recovery, and SDK cross-replica Task state. A deployment is ready only after the same checks pass with your issuer, shared stores, worker, broker, callbacks, gateway, and advertised bindings; the [conformance guide](05_production/05_conformance_and_interoperability.md) gives the release gate.
+
+## What's changing
+
+Checked 2026-10-12 against the [SDK releases](https://github.com/a2aproject/a2a-python/releases), [protocol releases](https://github.com/a2aproject/A2A/releases), and [official roadmap](https://github.com/a2aproject/A2A/blob/main/docs/roadmap.md). The runnable examples stay pinned to SDK 1.1.2; use [SDK Setup](03_python/01_sdk_setup.md) and [Scaling & Deployment](05_production/03_scaling_deployment.md) when evaluating an upgrade.
+
+| Item | Status | Decision impact |
+|---|---|---|
+| SDK 1.2.0 opt-in cluster mode; card cache and media-type validation | GA | Compare cluster mode with the explicit worker design and test card/runtime parity. |
+| SDK 1.2.2 SSE shutdown grace and REST/compatibility fixes | GA | Recheck shutdown, REST errors, and v0.3 conversion during upgrades. |
+| SDK 1.1.4 owner-scope and push URL fixes | GA security fixes | Upgrade the teaching pin before tenant-scoped or callback-enabled deployment. |
+| A2A 1.1 task timeline/event filtering and bidirectional streaming | Preview roadmap | Keep 1.0 SSE and Task guarantees as the baseline. |
+| Elicitation/multi-turn patterns and A2A CLI | Preview roadmap | Do not use proposed schemas or tooling as a conformance gate yet. |
+| v0.3 card/type fields removed in v1.0 | Deprecated/removed | Use the [migration guide](02_protocol/06_version_negotiation_and_migration.md) for mixed fleets. |
+
+[Glossary](GLOSSARY.md) defines the terms used across the paths and links to their teaching notes.

@@ -131,7 +131,7 @@ A **Task** is the central object of A2A. When a client asks a server to *do some
   "id": "task-9f3c1e",
   "contextId": "ctx-trip-planning-42",
   "status": {
-    "state": "working",
+    "state": "TASK_STATE_WORKING",
     "timestamp": "2026-05-18T14:03:11Z"
   },
   "history": [],
@@ -332,3 +332,26 @@ Every content payload a client sends or a server returns is ultimately represent
 ---
 
 **Next**: [Part 3: A2A vs MCP](03_a2a_vs_mcp.md)
+
+## Recap and check yourself
+
+- The client sends a Message; the server can create a Task to own work that continues after the reply.
+- A Part carries content inside a Message or Artifact. An Artifact is produced output attached to a Task.
+- A Task `id` selects one job; `contextId` groups related jobs and messages. Polling a context cannot identify one job.
+- On the wire, Task states use ProtoJSON enum names such as `TASK_STATE_WORKING`.
+
+**Q: The server starts a second hotel-booking Task in `ctx-trip-planning-42`. Which ID polls only the hotel booking?**
+
+<details><summary>Answer</summary>
+
+Use the new Task's `id`. `contextId` groups it with the earlier trip-planning work but does not select an individual Task.
+
+</details>
+
+**Q: The Kyoto agent returns a generated itinerary PDF. Does the PDF belong in the client's request Message or in the server's Task Artifact?**
+
+<details><summary>Answer</summary>
+
+It is server-produced output, so it belongs in an Artifact Part on the Task. The request Message records what the client asked for.
+
+</details>

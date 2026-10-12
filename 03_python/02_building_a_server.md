@@ -2,29 +2,33 @@
 
 <!-- length-justification: This implementation note keeps the runnable baseline and the same server's executor, streaming, shutdown, and failure paths together so readers can trace one lifecycle end to end. -->
 
-> **Who this is for**: Python engineers who have completed [SDK Setup](01_sdk_setup.md) and want to expose an agent over the A2A protocol. You should understand the [Task Lifecycle](../02_protocol/03_task_lifecycle.md) — this file shows how the executor *drives* that lifecycle. Targets `a2a-sdk` **1.1.2**.
+> **Who this is for**: Python engineers who have completed [SDK Setup](01_sdk_setup.md) and want to expose an agent over the A2A protocol. Run the echo baseline first; [Task Lifecycle](../02_protocol/03_task_lifecycle.md) explains the states before you change executor behavior. Targets `a2a-sdk` **1.1.2**.
 
 ---
 
 ## 1. The server in four pieces
 
-An A2A server is not a framework you subclass — it is four objects you wire together:
+An A2A server has separate discovery and task routes. The echo exchange below follows both routes; the card is served by the app and never passes through the executor.
 
+```mermaid
+sequenceDiagram
+  participant C as Echo client
+  participant App as Starlette routes
+  participant H as DefaultRequestHandler
+  participant E as EchoExecutor
+  participant Q as EventQueue / TaskStore
+  C->>App: GET /.well-known/agent-card.json
+  App-->>C: Echo Agent card
+  C->>App: SendMessage("hello")
+  App->>H: dispatch message
+  H->>E: execute(context, event_queue)
+  E->>Q: enqueue Task(id, SUBMITTED)
+  E->>Q: WORKING, echo Artifact, COMPLETED
+  Q-->>H: terminal Task state
+  H-->>C: Task COMPLETED; echo: hello
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  AgentCard          describes the agent (skills, transports)  │
-│       │             served at /.well-known/agent-card.json    │
-│       ▼                                                        │
-│  AgentExecutor      YOUR code — runs the agent, emits events  │
-│       │                                                        │
-│       ▼                                                        │
-│  DefaultRequestHandler   wires executor ⇄ TaskStore,          │
-│       │                  manages event queues per request     │
-│       ▼                                                        │
-│  Starlette / FastAPI app   route factories turn JSON-RPC      │
-│                            calls into executor invocations    │
-└──────────────────────────────────────────────────────────────┘
-```
+
+The handler owns dispatch and task persistence; the executor only emits lifecycle events. The initial Task establishes identity before later status and Artifact events. A streaming request receives those events in order as SSE; the synchronous `SendMessage` call shown here returns the terminal Task.
 
 > **Rule**: You implement exactly one thing — the `AgentExecutor`. Everything else is SDK plumbing you assemble.
 
@@ -118,7 +122,7 @@ Success is a response whose `result.task.status.state` is `TASK_STATE_COMPLETED`
 Install the HTTP server extra (from [SDK Setup](01_sdk_setup.md)):
 
 ```bash
-uv add "a2a-sdk[http-server]"   # pulls in starlette + uvicorn
+uv add "a2a-sdk[http-server]==1.1.2"   # keep the teaching baseline pinned
 ```
 
 ---
@@ -484,7 +488,20 @@ class CurrencyConverterExecutor(AgentExecutor):
 
         amount = float(match['amt'])
         src, dst = match['src'].upper(), match['dst'].upper()
-        rate = await self._fx.get_rate(src, dst)
+        try:
+            rate = await self._fx.get_rate(src, dst)
+        except (httpx.HTTPError, KeyError, ValueError):
+            # URLs and upstream response bodies may contain sensitive data.
+            await event_queue.enqueue_event(
+                TaskStatusUpdateEvent(
+                    task_id=task.id, context_id=task.context_id,
+                    status=TaskStatus(
+                        state=TaskState.TASK_STATE_FAILED,
+                        message=new_text_message('Rate service temporarily unavailable'),
+                    ),
+                )
+            )
+            return
         converted = round(amount * rate, 2)
 
         await event_queue.enqueue_event(
@@ -560,12 +577,45 @@ if __name__ == '__main__':
     uvicorn.run(build_app(), host='127.0.0.1', port=9999)
 ```
 
-Verify it is live:
+First verify discovery only:
 
 ```bash
 python -m currency_agent &
 curl -s http://127.0.0.1:9999/.well-known/agent-card.json | head
 ```
+
+That card request proves the route exists; it does not test conversion. For a deterministic conversion check without calling the public rate API, save the complete block above as `currency_agent.py` and run this local fixture in the same directory. It replaces only the external rate lookup and exercises the actual A2A JSON-RPC route:
+
+```bash
+python - <<'PY'
+import asyncio
+import httpx
+import currency_agent
+
+async def fake_rate(self, src, dst):
+    assert (src, dst) == ('USD', 'EUR')
+    return 0.9
+
+async def main():
+    currency_agent.FxClient.get_rate = fake_rate
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=currency_agent.build_app()),
+        base_url='http://127.0.0.1:9999',
+    ) as client:
+        request = {'jsonrpc': '2.0', 'id': 'fx-1', 'method': 'SendMessage',
+                   'params': {'message': {'messageId': 'fx-msg-1', 'role': 'ROLE_USER',
+                                          'parts': [{'text': 'convert 100 USD to EUR'}]}}}
+        response = await client.post('/', json=request, headers={'A2A-Version': '1.0'})
+        response.raise_for_status()
+        task = response.json()['result']['task']
+        print(task['status']['state'])
+        print(task['artifacts'][0]['parts'][0]['text'])
+
+asyncio.run(main())
+PY
+```
+
+Expected output is `TASK_STATE_COMPLETED` followed by `100.0 USD = 90.0 EUR (rate 0.9)`. To test the failed-rate path, make `fake_rate` raise `httpx.ConnectError('secret=sentinel')`; the Task must be `TASK_STATE_FAILED`, and its serialized public status must not contain `sentinel`. The fixture is a loopback/in-process test; use an authorized integration environment to test the real external provider and network timeouts.
 
 Sending messages and consuming the stream is covered in [Part 3: Building a Client](03_building_a_client.md).
 
@@ -668,18 +718,20 @@ But relying on that has two downsides: the client gets a generic error with no u
 ```python
 try:
     rate = await self._fx.get_rate(src, dst)
-except httpx.HTTPError as exc:
+except httpx.HTTPError:
     await event_queue.enqueue_event(
         TaskStatusUpdateEvent(
             task_id=task.id, context_id=task.context_id,
             status=TaskStatus(
                 state=TaskState.TASK_STATE_FAILED,
-                message=new_text_message(f'Rate service unavailable: {exc}'),
+                message=new_text_message('Rate service temporarily unavailable'),
             ),
         )
     )
     return
 ```
+
+An HTTP exception may contain a URL with query parameters or credentials. Keep the public status fixed; record the internal failure against a correlation/task ID in a restricted log after sanitizing its fields. In a failure test, inject a URL containing a sentinel secret and assert that the serialized Task status does not contain the sentinel.
 
 ⚠️ Other common breakage:
 
@@ -692,3 +744,25 @@ except httpx.HTTPError as exc:
 ---
 
 **Next**: [Part 3: Building a Client](03_building_a_client.md)
+
+## Recap, check yourself, and try it
+
+- The card route advertises the interface. The request handler dispatches a Message to the executor and stores the Task events it emits.
+- The executor emits the Task before status or Artifact updates, then a terminal status so the caller knows the work finished.
+- An expected external failure becomes a fixed, public `FAILED` status; exception internals stay in restricted diagnostics.
+
+**Q: EchoExecutor adds an Artifact but never calls `updater.complete()`. What does the caller observe?**
+
+<details><summary>Answer</summary>
+
+The Task has output but no terminal status. A synchronous caller can wait until its timeout, and a stream cannot signal normal completion. The executor must emit a terminal state after its final result.
+
+</details>
+
+**Try it:** modify `EchoExecutor.execute` so blank input fails before adding an Artifact. Keep the initial Task event, then insert an early branch after creating `TaskUpdater`. Hint: use `updater.failed(...)` with a fixed public message and return.
+
+<details><summary>Worked solution</summary>
+
+After `updater = TaskUpdater(...)`, check `if not context.get_user_input().strip(): await updater.failed(new_text_message("Input must contain text")); return`. Then run the same curl request with an empty text Part and check for `TASK_STATE_FAILED` and no echo Artifact. This preserves Task-first event order while making the error terminal.
+
+</details>

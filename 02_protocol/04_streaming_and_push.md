@@ -97,6 +97,25 @@ SSE assumes the client can hold a connection open for the entire task. That assu
 
 For these, A2A inverts the flow: the client registers a **webhook**, disconnects entirely, and the agent **POSTs task updates to that URL** when they happen. The client wakes only on real progress.
 
+This sequence shows who owns the public callback for `t-9f3` and why a mobile app does not receive A2A webhook POSTs directly.
+
+```mermaid
+sequenceDiagram
+  participant App as Mobile app
+  participant Backend as client.example.com backend
+  participant Agent as agent.example.com
+  App->>Backend: Start task t-9f3
+  Backend->>Agent: CreateTaskPushNotificationConfig(t-9f3, webhook URL)
+  Agent-->>Backend: config id push-42
+  Note over App,Agent: App disconnects while t-9f3 runs
+  Agent->>Backend: POST /a2a/webhook (t-9f3 statusUpdate)
+  Backend->>Backend: Verify auth and task ownership; persist idempotently
+  Backend-->>Agent: 204 No Content
+  Backend-->>App: Mobile notification or later status fetch
+```
+
+The backend registers and owns the HTTPS callback. It checks the incoming authentication and Task ownership before storing the update or alerting the app. The callback is a delivery signal; `GetTask` remains the reconciliation path if the POST is missed.
+
 This HTTP+JSON example creates a config for an existing Task. Credentials shown as angle-bracket placeholders come from a secret manager at runtime; they never belong in source or logs.
 
 ```http
@@ -206,6 +225,41 @@ Decision shortcut:
 ⚠️ The server guarantees at least one delivery attempt per configured webhook, not a retry schedule. It may retry with backoff and may stop after repeated failures. When delivery is uncertain — a drop, duplicate, reorder, or exhausted retry policy — fall back to `GetTask` and reconcile.
 
 > **Rule**: Design every notification handler to be idempotent and ordering-tolerant. Networks reorder, retry, and replay; a correct client assumes all three will happen.
+
+## What's changing
+
+The [A2A roadmap](https://github.com/a2aproject/A2A/blob/main/docs/roadmap.md) (checked 2026-10-12) proposes bidirectional streaming for active multi-turn exchange. This lesson's 1.0 SSE flows from server to client; it does not provide that planned bidirectional behavior.
+
+## Recap and check yourself
+
+- Streaming holds an SSE connection and can deliver chunks while the client is present.
+- Push sends authenticated POSTs to a public backend when a client cannot remain connected; polling reads state without either channel.
+- A dropped stream or callback does not end the Task. Reattach where possible and use `GetTask` to reconcile persisted state.
+- Verify callback authentication and Task ownership before applying updates; dedupe retries and refuse stale state regressions.
+
+**Q: The `t-9f3` SSE stream drops after the first artifact chunk. A second chunk is emitted during the gap. Does `SubscribeToTask` guarantee replay of it?**
+
+<details><summary>Answer</summary>
+
+No. A subscription gives a current snapshot and future events. Fetch `GetTask` to reconstruct artifacts that the server persisted; a chunk never persisted by the server cannot be recovered by reconnecting alone.
+
+</details>
+
+**Q: A webhook delivers `TASK_STATE_WORKING` after your backend stored `TASK_STATE_COMPLETED`. What state should the app show?**
+
+<details><summary>Answer</summary>
+
+Keep `COMPLETED`. Delivery can reorder, whereas a terminal Task cannot regress. If uncertain, read the authoritative Task with `GetTask`.
+
+</details>
+
+**Try it.** The backend loses its connection after receiving the first chunk of `a-1`. Write the recovery order. Hint: distinguish a live subscription from persisted Task state.
+
+<details><summary>Worked solution</summary>
+
+Reconnect with backoff using `SubscribeToTask` for `t-9f3`, then call `GetTask` and rebuild `a-1` from its persisted artifact. Continue consuming new events, deduping any overlap. If the server did not persist a missing chunk, report incomplete output rather than inventing it.
+
+</details>
 
 ---
 

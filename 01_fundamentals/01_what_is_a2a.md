@@ -204,3 +204,26 @@ A2A earns its keep when the other side is autonomous: it decides how to accompli
 ---
 
 **Next**: [Part 2: Core Concepts](02_core_concepts.md)
+
+## Recap and check yourself
+
+- A shared peer contract lets Travel Agent call Flights Agent through an advertised interface instead of a bespoke integration for each provider.
+- The Agent Card describes the callable boundary; the remote agent keeps its internal plan and tools private.
+- Replacing the implementation preserves the call path only while the advertised interface and behavior remain compatible.
+- Trust in an endpoint and authorization still need explicit checks; an opaque implementation does not provide access control.
+
+**Q: Flights Agent changes its internal framework but keeps its advertised interface and result behavior. What changes in Travel Agent's request?**
+
+<details><summary>Answer</summary>
+
+Nothing in the A2A request path needs to change. The caller depends on the advertised contract and still verifies that the endpoint and authorization are trusted.
+
+</details>
+
+**Q: A remote service merely returns airport codes for a city. Does being remote make it an A2A peer?**
+
+<details><summary>Answer</summary>
+
+No. It is a function-like service. A plain API or tool contract fits unless an autonomous agent owns a goal and collaboration lifecycle behind that boundary.
+
+</details>

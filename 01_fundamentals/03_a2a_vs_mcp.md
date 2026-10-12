@@ -8,7 +8,7 @@ Before reading this, understand the building blocks of A2A: **[Core Concepts](02
 
 ## 1️⃣ The Common Misconception
 
-The first question almost everyone asks is "A2A or MCP — which one do I pick?" That framing is wrong. They are not alternatives. They solve **different problems on different axes** of an agentic system, and a serious production app runs **both at once**.
+Choose the protocol that matches the counterpart and the contract you need. A function-like capability can use MCP or its ordinary API. An autonomous, discoverable agent peer can use A2A. Some systems need one protocol; a system with both tool calls and peer delegation may use both.
 
 | | **MCP (Model Context Protocol)** | **A2A (Agent2Agent Protocol)** |
 |---|---|---|
@@ -21,7 +21,7 @@ The first question almost everyone asks is "A2A or MCP — which one do I pick?"
 
 MCP is commonly the internal wiring of an agent, while A2A is external collaboration between agents. The analogy is directional, not exclusive: either protocol can cross a process or organizational boundary.
 
-Both protocols now live under the broader **Linux Foundation** umbrella, but not in the same project. A2A is hosted by the Linux Foundation's **Agent2Agent Protocol Project**. MCP moved to the Linux Foundation's **Agentic AI Foundation** in December 2025, alongside AGENTS.md and goose. The practical architecture point is unchanged: A2A and MCP are complements, not rivals.
+Both protocols now live under the broader **Linux Foundation** umbrella, but not in the same project. A2A is hosted by the Linux Foundation's **Agent2Agent Protocol Project**. MCP moved to the Linux Foundation's **Agentic AI Foundation** in December 2025, alongside AGENTS.md and goose. The practical architecture point is that they can work together when a system has both kinds of relationship.
 
 ---
 
@@ -147,3 +147,18 @@ These bridges are legitimate adapters at a boundary. But keeping each protocol a
 ---
 
 **Next**: [Part 1: The Agent Card](../02_protocol/01_agent_card.md)
+
+## Recap and decision exercise
+
+- Pick a protocol from the relationship the caller needs: tool invocation or peer delegation.
+- A2A adds a discoverable agent contract, messages, Task lifecycle, and Artifacts.
+- Duration alone does not make a capability an agent; a durable MCP Task can represent long-running tool work.
+- An adapter can bridge the protocols, but it must map any semantics the caller still needs.
+
+**Q: A support agent calls a remote OCR service that polls for ten minutes but never plans or negotiates. Which relationship fits?**
+
+<details><summary>Answer</summary>
+
+Use its ordinary API or a durable tool contract such as MCP Tasks. Long duration is a lifecycle property, not evidence of an autonomous peer. Reconsider A2A if the remote counterpart becomes a discoverable agent that owns a goal and exchanges messages or artifacts.
+
+</details>

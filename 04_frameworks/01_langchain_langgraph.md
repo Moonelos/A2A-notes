@@ -391,6 +391,46 @@ The executor side is unchanged — `needs_input` still drives `update_status(Tas
 
 `input-required` is neither failure nor completion. The Task is alive but waiting, and `contextId` keeps the checkpoint addressable for the next Message.
 
+This sequence shows why `ctx-7` must survive both HTTP requests. `task-7` is the A2A resource the caller continues; `ctx-7` is the key LangGraph uses to find the saved interrupt.
+
+```mermaid
+sequenceDiagram
+  participant C as A2A client
+  participant E as LangGraphExecutor
+  participant T as task store
+  participant P as graph checkpointer
+  C->>E: SendMessage task-7, ctx-7, approve expense
+  E->>P: astream(thread_id=ctx-7)
+  P-->>E: interrupt ticket-9 pending
+  E->>T: save task-7 INPUT_REQUIRED
+  E-->>C: task-7 INPUT_REQUIRED, ticket-9
+  C->>E: SendMessage task-7, ctx-7, yes on replica B
+  E->>T: load task-7
+  E->>P: Command(resume=yes), thread_id=ctx-7
+  P-->>E: approved result
+  E-->>C: artifact approved, task-7 COMPLETED
+```
+
+The `interrupt` is a graph event, not an A2A state by itself. The executor maps it to `INPUT_REQUIRED` and persists the Task. On the second request, `aget_state` must see a parked graph under `ctx-7`; only then does `Command(resume=...)` make sense. Replica B needs both the stored Task and the graph checkpoint. The example's `MemorySaver` and `InMemoryTaskStore` cannot satisfy that cross-replica condition; use shared stores before attempting this deployment. The local [adapter contract fixture](../examples/frameworks/adapter_contract.py) reproduces the event/state projection and changed-ID rejection without a model. It does not prove LangGraph or SDK compatibility.
+
+### Verify the real adapter without a model credential
+
+The [local LangGraph/A2A app](../examples/frameworks/langgraph_a2a_app.py) uses a LangGraph `interrupt()` node instead of an LLM. Its executor projects the graph pause to an A2A Task through `a2a-sdk` 1.1.2. The [driver](../examples/frameworks/run_langgraph_a2a.py) fetches the card, sends `expense-42`, observes `INPUT_REQUIRED`, stops the server, starts a new server process against the same SQLite files, and sends `yes` with the returned Task and context IDs. It asserts `COMPLETED` and an `approved=yes` artifact. Run from the repository root in a disposable Python 3.12 environment:
+
+```bash
+python -m pip install "a2a-sdk[http-server,sql]==1.1.2" "langgraph==1.2.14" "langgraph-checkpoint-sqlite==3.0.3" "uvicorn==0.54.0"
+python examples/frameworks/run_langgraph_a2a.py
+```
+
+Expected output:
+
+```text
+card=LangGraph Approval Fixture; first=TASK_STATE_INPUT_REQUIRED
+server restarted; same Task/context; final=TASK_STATE_COMPLETED; artifact=approved=yes
+```
+
+The app uses the SDK's `DatabaseTaskStore` and LangGraph's SQLite checkpointer. This proves process restart with persisted Task and graph state on one host; SQLite is a local fixture, not a multi-replica deployment store. It does not verify token streaming, model calls, ADK, or the other framework branches. The observed APIs and states are pinned to these versions; upgrade them together and rerun the driver.
+
 ⚠️ If you drop the `contextId` → `thread_id` mapping (e.g. generate a new UUID per request), the resume reads an empty checkpoint and the graph restarts from scratch — silently losing the conversation.
 
 ---
@@ -610,5 +650,37 @@ The client observes a failed Task or the binding's internal-error response witho
 > **Key insight**: Every code path through `execute` must end the Task in a terminal or interrupted state — `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, or `TASK_STATE_INPUT_REQUIRED`. A Task left in `TASK_STATE_WORKING` is invisible breakage: no error, no result, just a client waiting.
 
 ---
+
+## Recap and practice
+
+- The executor turns a graph result into an artifact and a completed A2A Task; intermediate graph output becomes status or artifact updates.
+- An interrupt needs a saved graph checkpoint and `INPUT_REQUIRED` Task state, then a continuation on the same Task and context.
+- A second replica can resume only if both stores are shared and the new request uses the checkpoint's original `contextId`.
+- Each streaming path must emit a terminal or interrupted state; otherwise the client waits without a result.
+
+**Q: The client sends `yes` for `task-7` but changes `ctx-7` to `ctx-8`. What happens?**
+
+<details><summary>Answer</summary>
+
+`ctx-8` selects a different LangGraph `thread_id`. The executor cannot find the parked checkpoint for `ticket-9`; it must reject the mismatched continuation rather than starting a new approval flow.
+
+</details>
+
+
+**Q: Replica B can read the Task store but uses its own `MemorySaver`. Can it resume the interrupt?**
+
+<details><summary>Answer</summary>
+
+No. The Task says `INPUT_REQUIRED`, but B's graph checkpointer has no saved interrupt for `ctx-7`. Both stores must be shared for cross-replica continuation.
+
+</details>
+
+**Try it:** In the `stream` excerpt, the graph has no parked interrupt (`state.next` is empty). Fill in the choice of input for a fresh user message. Hint: `Command(resume=...)` needs a saved pause.
+
+<details><summary>Worked solution</summary>
+
+Use `{"messages": [("user", query)]}`. Only use `Command(resume=query)` when `aget_state(config).next` identifies a parked graph under the same `thread_id`. For an A2A continuation that claims an old Task but has no checkpoint, surface a recovery error rather than silently treating it as a fresh request.
+
+</details>
 
 **Next**: [Part 2: Google ADK](02_google_adk.md)
