@@ -117,18 +117,15 @@ A LangGraph app is a compiled `StateGraph` or an agent created with `langchain.a
 
 The mapping you must implement:
 
-| LangGraph concept                  | A2A concept                                              |
-|-------------------------------------|----------------------------------------------------------|
-| Graph still running, tool call fired | `TASK_STATE_WORKING` + status update message            |
-| Graph finished, final answer        | `TaskArtifactUpdateEvent` + `TASK_STATE_COMPLETED`       |
-| `interrupt()` / needs user input    | `TASK_STATE_INPUT_REQUIRED` (terminal status update)     |
-| Exception raised in a node          | `TASK_STATE_FAILED` or an `A2AError` subclass            |
-| `thread_id` (checkpointer key)      | A2A `contextId`                                          |
+| LangGraph concept                    | A2A concept                                            |
+| ------------------------------------ | ------------------------------------------------------ |
+| Graph still running, tool call fired | `TASK_STATE_WORKING` + status update message         |
+| Graph finished, final answer         | `TaskArtifactUpdateEvent` + `TASK_STATE_COMPLETED` |
+| `interrupt()` / needs user input   | `TASK_STATE_INPUT_REQUIRED` (interrupted Task) |
+| Exception raised in a node           | `TASK_STATE_FAILED` or an `A2AError` subclass      |
+| `thread_id` (checkpointer key)     | A2A `contextId`                                      |
 
-> **v1.0 note**: `TaskState` is a protobuf enum — use the `TASK_STATE_*` constants
-> (`TaskState.TASK_STATE_WORKING`, etc.), not lowercase attributes. Reaching
-> `COMPLETED`/`FAILED`/`CANCELED`/`REJECTED` (or `INPUT_REQUIRED`) is itself the
-> terminal signal; there is no separate `final=` flag on `update_status`.
+> **v1.0 note**: `TaskState` is a protobuf enum; use its `TASK_STATE_*` constants. Completed, failed, canceled and rejected are terminal; input-required and auth-required are interrupted states. The state controls whether this execution turn finishes or pauses, without a separate `final=` flag on `update_status`.
 
 The `thread_id` ↔ `contextId` mapping is what makes multi-turn work: A2A's `contextId` is stable across a conversation, so using it as the LangGraph checkpointer `thread_id` means the graph resumes from its saved checkpoint on every follow-up message.
 
@@ -259,7 +256,7 @@ class CurrencyAgentExecutor(AgentExecutor):
 
                 elif item["needs_input"]:
                     # LangGraph wants more from the user -> input-required.
-                    # INPUT_REQUIRED is itself the terminal status; no final= flag.
+                    # INPUT_REQUIRED pauses the Task and returns control; no final= flag.
                     await updater.update_status(
                         TaskState.TASK_STATE_INPUT_REQUIRED, msg
                     )
@@ -360,7 +357,7 @@ LangGraph has two ways a graph pauses for a human:
 1. **`response_format` status field** (above) — the model itself decides it needs more info and emits `status="input_required"`. Simple, no checkpointer surgery.
 2. **`interrupt()`** — a node calls `langgraph.types.interrupt(...)`, which suspends the graph at a checkpoint until you resume with a `Command(resume=...)`.
 
-Both map to the same A2A state: **`TaskState.TASK_STATE_INPUT_REQUIRED`**. Reaching that state is itself the terminal signal on the stream — there is no `final=` flag in v1.0. The A2A client treats it as "the Task is paused; send another `SendMessage` request on the same `contextId` to continue."
+Both map to the same A2A state: **`TaskState.TASK_STATE_INPUT_REQUIRED`**. This is an interrupted Task, not a terminal one. The current send returns control without a separate `final=` flag in v1.0. The A2A client answers using a new Message with the existing `taskId`; matching `contextId` can be supplied or inferred. The server adapter maps that resolved context to the graph checkpoint. A context-only message does not identify the paused Task.
 
 ```python
 from langgraph.types import Command
@@ -439,16 +436,18 @@ The app uses the SDK's `DatabaseTaskStore` and LangGraph's SQLite checkpointer. 
 
 A2A streaming is `SendStreamingMessage`: the server pushes `TaskStatusUpdateEvent` and `TaskArtifactUpdateEvent` frames over Server-Sent Events. LangGraph's `astream` has several **`stream_mode`** values — pick based on the granularity you want to forward:
 
-| `stream_mode`  | Yields                                  | Forward to A2A as                       |
-|----------------|------------------------------------------|------------------------------------------|
-| `"values"`     | full state after each node               | coarse `working` status updates          |
-| `"updates"`    | only the delta each node produced        | per-node progress (`working`)            |
-| `"messages"`   | LLM token chunks `(token, metadata)`     | token-level streaming into an artifact   |
-| `"custom"`     | whatever a node emits via `StreamWriter` | app-defined progress signals             |
+| `stream_mode` | Yields                                     | Forward to A2A as                      |
+| --------------- | ------------------------------------------ | -------------------------------------- |
+| `"values"`    | full state after each node                 | coarse `working` status updates      |
+| `"updates"`   | only the delta each node produced          | per-node progress (`working`)        |
+| `"messages"`  | LLM token chunks `(token, metadata)`     | token-level streaming into an artifact |
+| `"custom"`    | whatever a node emits via `StreamWriter` | app-defined progress signals           |
 
-Token-level streaming — bridge `"messages"` mode into incremental artifact updates:
+Token-level streaming — this executor excerpt bridges text chunks from `"messages"` mode into incremental Artifact updates. Non-text content blocks need a separate Part conversion; the local [streaming lab](../02_protocol/00_client_server_walkthrough.md) demonstrates the resulting A2A events without a model dependency:
 
 ```python
+from uuid import uuid4
+
 async def execute(self, context, event_queue):
     task = context.current_task
     if not task:
@@ -461,14 +460,14 @@ async def execute(self, context, event_queue):
 
     config = {"configurable": {"thread_id": context.context_id}}
     inputs = {"messages": [("user", context.get_user_input())]}
-    buffer = ""
+    artifact_id = f"answer-{uuid4()}"  # one output identity across all chunks
+    started = False
 
     async for token, metadata in self.graph.astream(
         inputs, config, stream_mode="messages"
     ):
-        if not token.content:            # skip tool-call-only chunks
-            continue
-        buffer += token.content
+        if not isinstance(token.content, str) or not token.content:
+            continue  # this excerpt forwards text, not tool-call/content blocks
         # Each TaskArtifactUpdateEvent with append=True grows the same artifact.
         await updater.update_status(
             TaskState.TASK_STATE_WORKING,
@@ -476,18 +475,36 @@ async def execute(self, context, event_queue):
         )
         await updater.add_artifact(
             [Part(text=token.content)],
+            artifact_id=artifact_id,
             name="answer",
-            append=True,            # append to the existing artifact
+            append=started,         # False creates the base; True appends to it
             last_chunk=False,
         )
+        started = True
 
     await updater.add_artifact(
-        [Part(text="")], name="answer", append=True, last_chunk=True
+        [Part(text="")], artifact_id=artifact_id, name="answer",
+        append=started, last_chunk=True,
     )
     await updater.complete()
 ```
 
-> **Rule**: Emit a terminal frame. The SSE stream stays open until the Task reaches `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, or `TASK_STATE_INPUT_REQUIRED`. If `astream` finishes but you never call `updater.complete()`, the client hangs until timeout.
+> **Rule**: Finish or explicitly pause the execution turn. Complete successful work, report failure, or emit the appropriate interrupted state when input/auth is required. An input-required Task remains resumable even when the current send returns control; a subscription may remain open across a pause. Finishing `astream` does not automatically complete the A2A Task.
+
+The Artifact ID must remain stable: `TaskUpdater` generates a new ID when it is omitted, so repeated calls with only the same `name` do not identify one growing output. `last_chunk` ends that output; `updater.complete()` ends the Task.
+
+LangGraph's `"custom"` stream mode is local to LangGraph. Values emitted through its stream writer are not automatically A2A events. In a custom-mode adapter, iterate those values, validate the schema and translate them into a standard WORKING update, for example (excerpt inside the executor, with `inputs`, `config` and `updater` already defined):
+
+```python
+async for progress in self.graph.astream(inputs, config, stream_mode="custom"):
+    # This graph's writer and caller agree the reportProgress.v1 schema.
+    await updater.update_status(
+        TaskState.TASK_STATE_WORKING,
+        metadata={"com.example.reportProgress.v1": progress},
+    )
+```
+
+This progress-only excerpt does not emit the graph's final answer. The composed adapter must also produce the result Artifact and finish or pause the Task. If you request multiple stream modes, dispatch the framework's mode-tagged values first, then map progress to status metadata and text to Artifact chunks. [LangGraph's streaming docs](https://docs.langchain.com/oss/python/langgraph/streaming) also describe its newer typed event API; either API still needs this explicit A2A mapping. The A2A wire types stay the same.
 
 💡 Use `stream_mode=["values", "messages"]` (a list) to get both node-level state and token chunks in one pass — useful when you want progress status *and* streamed text.
 
@@ -601,14 +618,14 @@ The hosted server maps Agent Server runs onto A2A Tasks for you. The trade-off v
 
 ## 7. Failure modes
 
-| Failure                                  | Symptom                                              | Fix                                                                 |
-|-------------------------------------------|------------------------------------------------------|----------------------------------------------------------------------|
-| Blocking I/O directly inside an async node | Event loop stalls; SSE stream freezes for all clients | Use `graph.astream` / `ainvoke` and async clients; bound any sync-tool thread pool |
-| Lost `contextId` ↔ `thread_id` mapping    | Multi-turn "forgets"; interrupts restart the graph    | Always set `thread_id = task.context_id` in the checkpointer config  |
-| Error swallowed instead of propagated     | Task stuck in `working` forever; client times out     | Call `updater.failed(...)` or raise `ServerError(error=InternalError())` |
-| Stream ends without a terminal state      | SSE connection hangs until client timeout             | Always reach a terminal state: `updater.complete()`, `updater.failed()`, or `update_status(TASK_STATE_INPUT_REQUIRED, ...)` |
-| In-memory checkpointer in production      | Conversation state lost on restart / not shared       | Use `AsyncPostgresSaver` (or another persistent checkpointer)        |
-| `cancel()` not implemented                | Client cancel is a silent no-op                       | Implement `cancel`, or explicitly reject with `UnsupportedOperationError` |
+| Failure                                     | Symptom                                               | Fix                                                                                                                               |
+| ------------------------------------------- | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Blocking I/O directly inside an async node  | Event loop stalls; SSE stream freezes for all clients | Use `graph.astream` / `ainvoke` and async clients; bound any sync-tool thread pool                                            |
+| Lost `contextId` ↔ `thread_id` mapping | Multi-turn "forgets"; interrupts restart the graph    | Always set `thread_id = task.context_id` in the checkpointer config                                                             |
+| Error swallowed instead of propagated       | Task stuck in `working` forever; client times out   | Call `updater.failed(...)` or raise `ServerError(error=InternalError())`                                                      |
+| Stream ends without a terminal state        | SSE connection hangs until client timeout             | Finish or pause the turn: complete/fail, or emit an interrupted state when more input/auth is needed |
+| In-memory checkpointer in production        | Conversation state lost on restart / not shared       | Use `AsyncPostgresSaver` (or another persistent checkpointer)                                                                   |
+| `cancel()` not implemented                | Client cancel is a silent no-op                       | Implement `cancel`, or explicitly reject with `UnsupportedOperationError`                                                     |
 
 **Blocking calls** — distinguish an offloaded sync tool from blocking I/O inside an async node. The latter stalls every coroutine on that event loop:
 
@@ -665,7 +682,6 @@ The client observes a failed Task or the binding's internal-error response witho
 `ctx-8` selects a different LangGraph `thread_id`. The executor cannot find the parked checkpoint for `ticket-9`; it must reject the mismatched continuation rather than starting a new approval flow.
 
 </details>
-
 
 **Q: Replica B can read the Task store but uses its own `MemorySaver`. Can it resume the interrupt?**
 

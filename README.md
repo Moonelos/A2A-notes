@@ -2,7 +2,7 @@
 
 > A practical, implementation-focused guide to the Agent2Agent (A2A) protocol — from core concepts to production-grade multi-agent systems.
 
-**Audience:** developers comfortable with basic Python, HTTP, JSON, and command-line use; no prior A2A knowledge is assumed. Framework branches assume the chosen framework. The notes teach A2A wire protocol 1.0 (specification patch 1.0.1) and pin Python SDK 1.1.2 for reproducible examples. The SDK pin is historical as of 2026-10-12; newer 1.2.x behavior is covered as upgrade context. AP2 payment mandate details are outside this A2A learning path.
+**Audience:** developers comfortable with basic Python, HTTP, JSON, and command-line use; no prior A2A knowledge is assumed. Framework branches assume the chosen framework. The notes teach A2A wire protocol 1.0 (specification patch 1.0.1) and pin Python SDK 1.1.2 for reproducible examples. The SDK pin is historical as of 2026-10-12; newer 1.2.x/1.3.x behavior is covered as upgrade context. AP2 payment mandate details are outside this A2A learning path.
 
 **Production version gate:** [SDK 1.1.4 fixed owner-scoped cancel/subscribe and push callback URL validation](https://github.com/a2aproject/a2a-python/releases). Do not deploy the 1.1.2 teaching pin unchanged for multi-tenant or callback-enabled production; upgrade and rerun the isolation and callback tests in the production path.
 
@@ -27,6 +27,7 @@ a2a-notes/
 │
 │ ── PROTOCOL ───────────────────────────────────────────
 ├── 02_protocol/          The wire protocol: discovery, transport, lifecycle
+│   ├── 00_client_server_walkthrough.md  Exact requests/replies, live stream and custom progress
 │   ├── 01_agent_card.md          Card schema, skills, discovery, signed cards
 │   ├── 02_transport_and_rpc.md   JSON-RPC 2.0, gRPC, HTTP+JSON; RPC methods
 │   ├── 03_task_lifecycle.md      Task states, the state machine, errors
@@ -76,6 +77,7 @@ a2a-notes/
 
 | Guide | Description |
 |-------|-------------|
+| [Follow the Messages](02_protocol/00_client_server_walkthrough.md) | Complete client/server exchanges, streaming frames, custom progress and a runnable local lab |
 | [The Agent Card](02_protocol/01_agent_card.md) | Card schema, skill declarations, discovery via well-known URI, signed and extended cards |
 | [Transport & RPC](02_protocol/02_transport_and_rpc.md) | JSON-RPC, gRPC, and HTTP+JSON bindings; the full set of RPC methods |
 | [Task Lifecycle](02_protocol/03_task_lifecycle.md) | The Task state machine, terminal states, input/auth-required pauses, error codes |
@@ -130,7 +132,8 @@ a2a-notes/
 1. [What Is A2A?](01_fundamentals/01_what_is_a2a.md) — understand the problem before the solution
 2. [Core Concepts](01_fundamentals/02_core_concepts.md) — learn the vocabulary every later file uses
 3. [A2A vs MCP](01_fundamentals/03_a2a_vs_mcp.md) — conceptual stop: you can now decide which protocol belongs where
-4. [The Agent Card](02_protocol/01_agent_card.md) — continue here when you will implement discovery
+4. [Follow the Messages](02_protocol/00_client_server_walkthrough.md) — see exact requests/replies and watch streaming locally
+5. [The Agent Card](02_protocol/01_agent_card.md) — continue here when you will implement discovery
 
 ### Path 2 — Implementing in Python
 
@@ -160,12 +163,20 @@ After the agent is exposed, use [Core Concepts](01_fundamentals/02_core_concepts
 
 The production notes include executable local proofs for owner-scoped JSON-RPC access, worker crash recovery, and SDK cross-replica Task state. A deployment is ready only after the same checks pass with your issuer, shared stores, worker, broker, callbacks, gateway, and advertised bindings; the [conformance guide](05_production/05_conformance_and_interoperability.md) gives the release gate.
 
+## Follow one client interaction
+
+Start with [Follow the Messages](02_protocol/00_client_server_walkthrough.md): one complete request-to-follow-up story, an annotated SSE stream, custom progress and a real local client/server lab.
+
+For the deeper request-to-follow-up reference path, start with [who creates each ID and what “session” means](01_fundamentals/02_core_concepts.md#who-creates-each-id), then read the [direct Message and Task response examples](02_protocol/02_transport_and_rpc.md#3-a-complete-json-rpc-requestresponse-pair), the [report clarification exchange](02_protocol/03_task_lifecycle.md#one-report-through-a-pause-and-completion), and [first subscription plus completion-race recovery](02_protocol/04_streaming_and_push.md#2-subscribing-to-existing-work). The [Python consumer and local scenarios](03_python/03_building_a_client.md#8-run-the-client-workflow) map those decisions to SDK 1.1.2.
+
 ## What's changing
 
-Checked 2026-10-12 against the [SDK releases](https://github.com/a2aproject/a2a-python/releases), [protocol releases](https://github.com/a2aproject/A2A/releases), and [official roadmap](https://github.com/a2aproject/A2A/blob/main/docs/roadmap.md). The runnable examples stay pinned to SDK 1.1.2; use [SDK Setup](03_python/01_sdk_setup.md) and [Scaling & Deployment](05_production/03_scaling_deployment.md) when evaluating an upgrade.
+Checked 2026-10-28 against the [SDK releases](https://github.com/a2aproject/a2a-python/releases), [protocol releases](https://github.com/a2aproject/A2A/releases), and [official roadmap](https://github.com/a2aproject/A2A/blob/main/docs/roadmap.md). The runnable examples stay pinned to SDK 1.1.2; use [SDK Setup](03_python/01_sdk_setup.md) and [Scaling & Deployment](05_production/03_scaling_deployment.md) when evaluating an upgrade.
 
 | Item | Status | Decision impact |
 |---|---|---|
+| SDK [1.3.0](https://github.com/a2aproject/a2a-python/releases/tag/v1.3.0) interrupted-runtime timeout | GA | Evaluate release of parked runtime work separately from persisted Task state and continuation. |
+| SDK [1.2.3](https://github.com/a2aproject/a2a-python/releases/tag/v1.2.3) follow-up execution context and direct-Message cleanup | GA fixes | Test both response branches and follow-ups during upgrades; the teaching pin stays 1.1.2. |
 | SDK 1.2.0 opt-in cluster mode; card cache and media-type validation | GA | Compare cluster mode with the explicit worker design and test card/runtime parity. |
 | SDK 1.2.2 SSE shutdown grace and REST/compatibility fixes | GA | Recheck shutdown, REST errors, and v0.3 conversion during upgrades. |
 | SDK 1.1.4 owner-scope and push URL fixes | GA security fixes | Upgrade the teaching pin before tenant-scoped or callback-enabled deployment. |

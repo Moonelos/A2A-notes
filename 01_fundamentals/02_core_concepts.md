@@ -155,7 +155,7 @@ A **Message** represents a single turn in the conversation between client and se
 | `messageId`         | string     | Unique identifier created by the sender. |
 | `role`              | enum       | `ROLE_USER` (from the client) or `ROLE_AGENT` (from the server). |
 | `parts`             | Part[]     | The content of the turn — one or more Parts. |
-| `contextId`         | string     | Conversation this Message belongs to (see §8). |
+| `contextId`         | string     | Optional on client Messages; required on server Messages (see §8). |
 | `taskId`            | string     | Task this Message relates to, if any. |
 | `referenceTaskIds`  | string[]   | Other Tasks this Message refers to. |
 | `metadata`          | object     | Arbitrary sender-supplied data. |
@@ -262,25 +262,63 @@ An **Artifact** is a concrete result produced by a Task — a generated report, 
 }
 ```
 
-Messages are how agents talk; Artifacts are what they produce. A Task's `history` holds the conversation, while `artifacts` holds results.
+Messages are how agents talk; Artifacts are what they produce. A Task's `history` holds the conversation, while `artifacts` holds results. A completed Task can have zero, one, or several Artifacts; completion is a lifecycle fact, not a promise that `artifacts[0]` exists.
+
+`artifactId` identifies an output within its Task. `name` is an optional display label, not a required or unique lookup key. Two outputs can share a name, and one output can contain several Parts. A frontend should preserve all outputs by `(task.id, artifactId)` and all their Parts. If it needs a specific report/chart layout, agree an application schema for output meaning, media types and missing outputs. A2A itself does not assign those business meanings.
 
 ---
 
-## 8️⃣ contextId: Grouping Tasks Into a Conversation
+## 8️⃣ Identity: From the First Request to the Next Turn
 
-A **contextId** is a string identifier (typically a UUID) that ties together all Tasks and Messages belonging to the same logical conversation or workflow. It is the protocol's notion of a "session."
+Suppose the client asks for a sales report. Before receiving any reply it knows its outgoing Message, but it does not yet know whether the server will create a Task. Inventing a `taskId` would claim that a Task already exists. Instead, the first request normally omits both `taskId` and `contextId`; the response supplies the identity the client needs for later turns.
 
-Both `Task` and `Message` carry an optional `contextId`. When a client wants several Tasks treated as one ongoing collaboration — a multi-turn trip-planning session, say — it reuses the same `contextId` across all of them.
+### Who creates each ID?
 
+| Identifier | Creator | What the client does with it |
+|---|---|---|
+| JSON-RPC envelope `id`, such as `req-001` | Calling side; the Python SDK's JSON-RPC transport generates it | Match one RPC response to its request. It is not a Task or conversation ID. |
+| Message `messageId`, such as `msg-001` | That Message's sender | Create a fresh ID for a new turn; retain the same ID for a retry only under the server's deduplication contract. |
+| Task `id`, such as `task-123` | Server when it creates work | Save it; send it as Message `taskId` to address that existing Task or as `GetTask.params.id` to read it. |
+| `contextId`, such as `ctx-sales-001` | Server can allocate it when omitted; client-created values depend on server acceptance | Save the returned value and reuse it for conversation continuity. Treat server-generated values as opaque. |
+| `artifactId`, such as `art-summary` | Output-producing server; a server SDK helper may allocate it | Track the output within its owning Task. |
+
+If a client supplies a new `contextId`, a server that accepts it preserves it; a server that cannot accept it rejects the request instead of silently substituting another context. The portable starting point is to omit it until you know the server's policy. Supplying a new `taskId` never creates a Task: an unknown ID produces `TaskNotFoundError`.
+
+These are [protocol identity rules](https://a2a-protocol.org/latest/specification/#34-multi-turn-interactions); allocation by a particular SDK helper is an implementation detail. In the [Python server baseline](../03_python/02_building_a_server.md), server-side helpers and the handler provide identity while the executor decides which work/output to produce. The client does not allocate remote Task IDs.
+
+### Watch identity cross the first request boundary
+
+This Task-producing server needs the reporting month before it can finish. The new Message ID changes on the answer, but the selected Task remains the same.
+
+```mermaid
+sequenceDiagram
+  participant C as Sales client
+  participant A as Report agent
+  C->>A: SendMessage(msg-001, no taskId or contextId)
+  A->>A: Allocate task-123 in ctx-sales-001
+  A-->>C: Task task-123, ctx-sales-001, INPUT_REQUIRED
+  C->>C: Save IDs and display the question
+  C->>A: SendMessage(msg-003, taskId=task-123, October 2026)
+  A->>A: Infer ctx-sales-001 from task-123
+  A-->>C: Same Task COMPLETED with sales report
 ```
-contextId: "ctx-trip-planning-42"
-   │
-   ├── Task task-9f3c1e   ("find flights")        status: completed
-   ├── Task task-a72d04   ("book hotel")          status: working
-   └── Message msg-118    ("also add a car")      role: ROLE_USER
-```
 
-`id` (or `taskId`) scopes one piece of work; `contextId` scopes a conversation that may contain several Tasks.
+The last request can omit `contextId` because `taskId` resolves it. Supplying both is also valid, provided they match. A context-only Message does not select the waiting Task: it starts another interaction within that conversation, and the agent decides whether to answer with a Message or create work. [Task Lifecycle](../02_protocol/03_task_lifecycle.md) develops the full input-required exchange.
+
+A direct Message reply is another valid first-response path. It has a server-created `messageId` and a `contextId`, without a `taskId`. Save its context too: a conversation can continue even when no Task was created.
+
+### A conversation context is not every kind of session
+
+A **contextId** groups related Tasks and Messages. It does not itself guarantee retained LLM memory, a durable event log, or unlimited history. The server decides what context it retains and when it expires. [The specification](https://a2a-protocol.org/latest/specification/#341-context-identifier-semantics) makes those persistence policies server-specific.
+
+| Name you may encounter | Meaning and owner |
+|---|---|
+| Application/login session ID | Your application or authentication system identifies a browser/user session. It can contain multiple agent conversations. |
+| A2A `contextId` | Conversation grouping at the selected remote agent. Keep it associated with that agent endpoint and caller. |
+| SDK credential-store `sessionId` | Caller-provided lookup key in `ClientCallContext.state`; it selects credentials, not conversational work. |
+| Framework session / LangGraph `thread_id` | Framework persistence key. The server adapter must deliberately map the A2A context to it; A2A does not create this mapping automatically. |
+
+For example, your backend may store application session `app-42` -> report-agent context `ctx-sales-001` -> Tasks `task-123` and `task-456`. It separately looks up credentials under `credentials-42`. Matching these strings is an application choice, not a protocol requirement; none of them grants authorization by itself. See the [client credential example](../03_python/03_building_a_client.md#7-passing-auth-credentials).
 
 ---
 
@@ -337,7 +375,7 @@ Every content payload a client sends or a server returns is ultimately represent
 
 - The client sends a Message; the server can create a Task to own work that continues after the reply.
 - A Part carries content inside a Message or Artifact. An Artifact is produced output attached to a Task.
-- A Task `id` selects one job; `contextId` groups related jobs and messages. Polling a context cannot identify one job.
+- A Task `id` selects one job; `contextId` groups related jobs and messages. Save context from direct Message replies too. Application and credential sessions have separate owners.
 - On the wire, Task states use ProtoJSON enum names such as `TASK_STATE_WORKING`.
 
 **Q: The server starts a second hotel-booking Task in `ctx-trip-planning-42`. Which ID polls only the hotel booking?**
@@ -353,5 +391,13 @@ Use the new Task's `id`. `contextId` groups it with the earlier trip-planning wo
 <details><summary>Answer</summary>
 
 It is server-produced output, so it belongs in an Artifact Part on the Task. The request Message records what the client asked for.
+
+</details>
+
+**Q: You know `task-123` but omit `contextId` when answering its question. Does the server create a second Task?**
+
+<details><summary>Answer</summary>
+
+No. The existing `taskId` selects the Task, and the server infers its context. If you supply a different context alongside that Task ID, the server rejects the mismatch. Sending only the original context would preserve conversation grouping without selecting the waiting Task.
 
 </details>

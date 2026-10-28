@@ -6,6 +6,8 @@
 
 ---
 
+For a runnable executor that asks a question, emits custom stage metadata and streams an Artifact in chunks, use the [report streaming lab](../02_protocol/00_client_server_walkthrough.md#5-run-the-same-interaction-and-watch-it-arrive) alongside this server reference.
+
 ## 1. The server in four pieces
 
 An A2A server has separate discovery and task routes. The echo exchange below follows both routes; the card is served by the app and never passes through the executor.
@@ -112,6 +114,8 @@ curl -s http://127.0.0.1:9999/ \
   -H 'A2A-Version: 1.0' \
   -d '{"jsonrpc":"2.0","id":"demo-1","method":"SendMessage","params":{"message":{"messageId":"msg-1","role":"ROLE_USER","parts":[{"text":"hello"}]}}}'
 ```
+
+The first client Message supplies `messageId` but no Task/context IDs. In this baseline, `new_task_from_user_message(context.message)` allocates the Task ID and a context when absent; `TaskUpdater` emits its state and output events. On an existing-Task continuation, the handler resolves `context.current_task`, so the executor reuses that object. The server handler must reject unknown Task references before execution: a low-level helper accepting an ID is not permission for a client to create remote work under an invented Task ID. The executor chooses Task output here; a direct Message response is also possible in A2A. See the [identity walkthrough](../01_fundamentals/02_core_concepts.md#who-creates-each-id).
 
 Success is a response whose `result.task.status.state` is `TASK_STATE_COMPLETED` and whose Artifact text is `echo: hello`. A `404` means `rpc_url` and the advertised interface path disagree; an import failure naming Starlette means the `http-server` extra is missing.
 

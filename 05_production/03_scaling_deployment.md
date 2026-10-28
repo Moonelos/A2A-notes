@@ -120,10 +120,12 @@ A2A tasks routinely outlive a sane HTTP request: research jobs, multi-step tool 
 - a dropped connection or a deploy killing in-flight work;
 - load-balancer and proxy idle timeouts (often 30–60s) severing the request mid-task.
 
-> **Principle**: The HTTP request's job is to *accept the task and return a `taskId`*. The actual work belongs to a background tier.
+For this early-response worker pattern, use `SendMessage` with `configuration.returnImmediately: true`. The response contains a Task snapshot with its server-issued `id`; there is no separate top-level `taskId` response. Default blocking `SendMessage` still waits until a terminal or interrupted state, even when a worker performs the execution.
+
+> **Principle**: Persist and schedule accepted work independently of the observer's HTTP connection. Polling, subscription and push choose how clients learn state; they do not by themselves keep execution alive after a process failure.
 
 ```
-SendMessage  ──▶  web tier: persist Task(state=TASK_STATE_SUBMITTED), enqueue job, return taskId
+Nonblocking SendMessage  ──▶  web tier: persist Task(SUBMITTED), enqueue job, return Task snapshot
                                           │
                                           ▼
                               ┌───────────────────────┐

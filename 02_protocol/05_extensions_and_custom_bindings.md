@@ -63,7 +63,7 @@ HTTP/1.1 200 OK
 Content-Type: application/json
 A2A-Extensions: https://example.com/a2a/extensions/routing/v1
 
-{"jsonrpc":"2.0","id":"route-1","result":{"message":{"messageId":"msg-recipe-1","role":"ROLE_AGENT","parts":[{"text":"Try a lentil stew."}]}}}
+{"jsonrpc":"2.0","id":"route-1","result":{"message":{"messageId":"msg-recipe-1","contextId":"ctx-recipe-1","role":"ROLE_AGENT","parts":[{"text":"Try a lentil stew."}]}}}
 ```
 
 The request may then carry extension data in the location its specification defines, commonly a core `metadata` map or a schema-defined `DataPart`. The server validates the carrier before use. If the optional URI is absent from the request header, `route: vegetarian` alone does not activate routing and the server applies baseline behavior. If the URI is unsupported, an optional extension may be ignored and is absent from the response echo; the client must not assume routing happened. If the card marks it `required: true` and the client omits activation, the server fails with `ExtensionSupportRequiredError`. Never silently substitute another extension version. These gates follow the [A2A extension declaration and service-parameter rules](https://a2a-protocol.org/latest/specification/) (checked 2026-10-12).
@@ -73,6 +73,14 @@ The request may then carry extension data in the location its specification defi
 An extension specification must define its URI, carriers and schemas, flows/methods, errors, authorization, and required dependencies. The client activates the extension plus all required dependencies. Give a breaking revision a new URI such as `/v2`; the URI is the negotiated version.
 
 Extensions cannot add fields directly to core protobuf messages or invent enum values. Put additional data in defined metadata/data carriers. New RPC methods, if any, must pass through the same authentication, authorization, rate limits, and tenant scoping as core methods.
+
+## Custom progress on a standard stream
+
+A frontend may need a `step_completed` annotation while the Task is still `WORKING`. Keep the core `TaskStatusUpdateEvent` and carry the annotation in its metadata. For example, a versioned extension can specify carrier `TaskStatusUpdateEvent.metadata["com.example.reportProgress.v1"]` with fields `event`, `step`, `completed` and `total`. Define the counter meaning, validation, unknown-value behavior and whether progress is retained; a namespace string by itself defines none of those rules.
+
+The [message and streaming walkthrough](00_client_server_walkthrough.md#4-add-custom-progress-without-inventing-a-fifth-a2a-payload) implements an explicit private application convention and explains how it could become a declared extension. Its lab remains usable by clients that ignore the optional annotation. It does not implement extension activation. If your behavior depends on formal negotiation, the card declares a URI, the caller requests it, and the server activates it before giving the carrier that extension's meaning.
+
+Do not add a new core field such as `StreamResponse.toolCall` or invent a TaskState enum value. Changing `event: message` to `event: tool_call` in SSE does not define an A2A schema either. The transport event name and the typed A2A payload are different layers. These limits follow the [official extension rules](https://a2a-protocol.org/latest/topics/extensions/#limitations), checked 2026-10-28.
 
 ## When a custom binding is justified
 

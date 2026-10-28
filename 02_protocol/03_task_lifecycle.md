@@ -15,12 +15,12 @@ Not every A2A interaction produces a Task. When a client sends `SendMessage`, th
                            │
               ┌────────────┴────────────┐
               ▼                         ▼
-   Quick, synchronous work     Long-running / multi-turn work
+   Direct reply chosen          Stateful work chosen
               │                         │
               ▼                         ▼
    Returns a Message            Returns a Task
    (has messageId, but          (has id, contextId, status;
-    no taskId/lifecycle)         client tracks it over time)
+    no taskId/lifecycle)         may already be completed)
 ```
 
 - A **Message** result is terminal by construction. There is nothing to poll, nothing to cancel. The agent answered and moved on.
@@ -194,12 +194,14 @@ The resume flow:
 
 The critical detail is step 4: the follow-up Message must reference the existing `taskId`. `contextId` may be omitted when `taskId` is present; the server then infers it. If the client supplies both, they must match the existing Task or the server rejects the request.
 
-> **Rule**: To answer an `input-required` Task, send a new Message with the original `taskId`; also preserve `contextId` when your client carries it. Omitting `taskId` starts new work. Supplying a mismatched `taskId`/`contextId` pair is an error, not a new conversation.
+> **Rule**: To answer an `input-required` Task, send a new Message with the original `taskId`; also preserve `contextId` when your client carries it. Omitting `taskId` does not select the waiting Task; the server handles a new interaction and may return a Message or create new work. Supplying a mismatched `taskId`/`contextId` pair is an error, not a new conversation.
 
 ✅ Correct — the answer routes back to the waiting Task:
 
 ```json
 {
+  "jsonrpc": "2.0",
+  "id": "req-input-answer-1",
   "method": "SendMessage",
   "params": {
     "message": {
@@ -213,7 +215,77 @@ The critical detail is step 4: the follow-up Message must reference the existing
 }
 ```
 
-❌ Wrong — no `taskId`, so this spawns an orphan Task and the original stays stuck in `input-required` forever.
+❌ Missing `taskId` — the request does not identify the paused Task. It may receive a direct Message or create separate work; the original Task is not resumed by this routing alone.
+
+---
+
+### One report through a pause and completion
+
+Use the [first report request and response examples](02_transport_and_rpc.md#3-a-complete-json-rpc-requestresponse-pair) as the starting point. In this variant, the client sends `Generate a sales report` without Task/context IDs. The server allocates `task-123` / `ctx-sales-001` and returns this blocking response because it needs another turn:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-report-001",
+  "result": {
+    "task": {
+      "id": "task-123",
+      "contextId": "ctx-sales-001",
+      "status": {
+        "state": "TASK_STATE_INPUT_REQUIRED",
+        "message": {
+          "messageId": "msg-question-001",
+          "role": "ROLE_AGENT",
+          "taskId": "task-123",
+          "contextId": "ctx-sales-001",
+          "parts": [{"text": "For which month should I generate the report?"}]
+        }
+      }
+    }
+  }
+}
+```
+
+The client displays `status.message.parts` and keeps the Task open. The answer is a new Message, addressed to that same work:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-report-002",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "messageId": "msg-answer-001",
+      "role": "ROLE_USER",
+      "taskId": "task-123",
+      "parts": [{"text": "October 2026"}]
+    }
+  }
+}
+```
+
+The server resolves the context from `task-123`; adding `contextId: "ctx-sales-001"` would have the same routing effect. With default blocking behavior, the reply waits until another interrupted or terminal state. In this scenario it completes:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-report-002",
+  "result": {
+    "task": {
+      "id": "task-123",
+      "contextId": "ctx-sales-001",
+      "status": {"state": "TASK_STATE_COMPLETED"},
+      "artifacts": [{
+        "artifactId": "art-summary",
+        "name": "summary",
+        "parts": [{"text": "October total sales: $150,000"}]
+      }]
+    }
+  }
+}
+```
+
+`req-report-002` correlates this RPC, `msg-answer-001` identifies its Message, and `task-123` still identifies the original work. `GetTask` could observe that work but could not supply the missing month. For nonblocking observation or live updates, continue with [Streaming & Push](04_streaming_and_push.md#2-subscribing-to-existing-work).
 
 ---
 
@@ -263,7 +335,7 @@ For non-streaming clients, the lifecycle is observed by **polling**:
 }
 ```
 
-This gives the agent context (the earlier completed Task) without violating the "terminal is forever" rule.
+This gives the agent a reference to earlier work without violating the "terminal is forever" rule. The previous Task remains completed. The server may answer the new request directly with a Message or allocate a different Task in the same context; omitting `taskId` is not a command to allocate one. In a JSON-RPC call, put the Message above in `params.message` of a new `SendMessage` request with a fresh envelope ID. Reference resolution and retained history still depend on access and the agent's context policy.
 
 💡 `referenceTaskIds` lives on the **`Message`**, not on the `Task` object. It links *across* task boundaries; `taskId` continues *within* one.
 
@@ -286,6 +358,8 @@ The lifecycle is small, but clients break it in predictable ways.
 > **Key insight**: Most lifecycle bugs are the same bug — the client collapsed the three-bucket model into two. Model Active, Interrupted, and Terminal explicitly, persist `taskId` + `contextId` for every open Task, and re-read state after every `cancel`.
 
 ## What's changing
+
+SDK [1.3.0](https://github.com/a2aproject/a2a-python/releases/tag/v1.3.0) adds configurable release of parked interrupted runtime tasks (checked 2026-10-28). This is upgrade context for the 1.1.2 teaching pin: releasing an in-process runtime resource does not itself establish that the persisted protocol Task completed, was canceled, or expired. Check continuation after the timeout during an upgrade.
 
 The [A2A roadmap](https://github.com/a2aproject/A2A/blob/main/docs/roadmap.md) (checked 2026-10-12) labels task timelines, event filtering, messages during a working state, and structured elicitation as planned work. Treat them as proposals; this lesson's 1.0 state machine and continuation rules remain the baseline until a released version specifies otherwise.
 

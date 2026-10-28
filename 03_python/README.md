@@ -14,7 +14,7 @@
 |------|-------|-------------|
 | [01_sdk_setup.md](01_sdk_setup.md) | Setup | Installing `a2a-sdk`, optional extras, project layout, and version compatibility |
 | [02_building_a_server.md](02_building_a_server.md) | Server | Implementing `AgentExecutor`, request handlers, and serving over Starlette/FastAPI |
-| [03_building_a_client.md](03_building_a_client.md) | Client | Resolving Agent Cards, `ClientFactory`, sending tasks, and consuming streams |
+| [03_building_a_client.md](03_building_a_client.md) | Client | Discovery, typed response dispatch, Parts, follow-ups, polling and subscription recovery |
 
 ---
 

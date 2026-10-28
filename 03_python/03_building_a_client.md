@@ -8,6 +8,8 @@ Before reading this, understand the server side: **[Building a Server](02_buildi
 
 > **Rule**: Everything here targets `a2a-sdk` **`1.1.2`**. The wire model uses Protocol Buffers types. A protobuf **`oneof`** is a group in which exactly one field may be active, so response code uses `HasField()` before reading `message`, `task`, `status_update`, or `artifact_update`. **gRPC** is A2A's typed remote-procedure-call binding over HTTP/2; **Server-Sent Events (SSE)** is the HTTP stream used by JSON-RPC and HTTP+JSON.
 
+For exact request bodies, the open SSE response, and custom progress before the SDK abstraction, read [Follow the Messages](../02_protocol/00_client_server_walkthrough.md). Its live lab prints outgoing Messages and every received event.
+
 ## Quick start: discover, create, send, interpret
 
 Start the echo server from [Building a Server](02_building_a_server.md), then save this as `echo_client.py`:
@@ -228,7 +230,7 @@ msg = Message(
     ],
 )
 
-request = SendMessageRequest(message=msg)      # no context/task id => start a new task
+request = SendMessageRequest(message=msg)      # new interaction; server chooses Message or Task
 ```
 
 `Client.send_message()` is **always an async iterator**, even for a non-streaming agent — `BaseClient` wraps a single non-streaming reply into a one-item stream so your code has one shape. Each item is a `StreamResponse`, a `oneof` over four cases:
@@ -236,28 +238,28 @@ request = SendMessageRequest(message=msg)      # no context/task id => start a n
 | `StreamResponse` field | Meaning                                              |
 |------------------------|------------------------------------------------------|
 | `message`              | A direct reply — a **quick answer**, no task created |
-| `task`                 | A **`Task`** snapshot — long-running work            |
+| `task`                 | A **`Task`** snapshot — inspect its state and outputs            |
 | `status_update`        | `TaskStatusUpdateEvent` — a state transition         |
 | `artifact_update`      | `TaskArtifactUpdateEvent` — an output chunk          |
 
 ```python
 async for event in client.send_message(request=request):
     if event.HasField("message"):
-        # Quick reply: the agent answered inline, nothing to track.
+        # No Task to poll; save event.message.context_id for conversation continuity.
         print("reply:", event.message.parts[0].text)
     elif event.HasField("task"):
-        # Long-running: hold on to BOTH ids for follow-ups / polling.
+        # Save Task identity and context; inspect status and outputs too.
         task = event.task
         print(f"task {task.id} ctx {task.context_id} -> {task.status.state}")
 ```
 
-> **Rule**: Never assume the response is a `Task`. A `message`-only reply has **no `task.id`** — code that does `event.task.id` unconditionally crashes the first time an agent answers a trivial question inline. Branch on `HasField` every time.
+> **Rule**: Never assume the response is a `Task`. A `message`-only reply has no active Task payload. Protobuf may return an empty default submessage when you read `event.task` anyway, silently giving `id=""`; field access is not a presence check. Branch on `HasField` every time.
 
 ❌ Anti-pattern — assuming a task always exists:
 
 ```python
 event = await anext(client.send_message(request=request))
-task_id = event.task.id          # AttributeError when the agent sent a `message`
+task_id = event.task.id          # empty/default ID can be mistaken for real Task identity
 ```
 
 ✅ Branch, then capture identity:
@@ -265,7 +267,9 @@ task_id = event.task.id          # AttributeError when the agent sent a `message
 ```python
 task_id = context_id = None
 async for event in client.send_message(request=request):
-    if event.HasField("task"):
+    if event.HasField("message"):
+        context_id = event.message.context_id  # conversation can continue without a Task
+    elif event.HasField("task"):
         task_id, context_id = event.task.id, event.task.context_id
     elif event.HasField("status_update"):
         task_id, context_id = event.status_update.task_id, event.status_update.context_id
@@ -273,159 +277,153 @@ async for event in client.send_message(request=request):
 
 ---
 
-## 5. Consuming a Stream
+### What the SDK does, and what your application decides
 
-When the agent advertises `capabilities.streaming` and your `ClientConfig.streaming=True`, `send_message()` yields events live as the agent produces them. You consume the same `StreamResponse` `oneof`, plus the two update events.
+| Responsibility | SDK infrastructure | Application workflow |
+|---|---|---|
+| Wire format and transport | Serializes requests, assigns JSON-RPC envelope IDs, parses typed results/events | Creates Message IDs and supplies content, configuration and credentials |
+| Message/Task distinction | Exposes the response oneof | Inspects it and saves the relevant identity, including context from direct replies |
+| Task state | Provides snapshots, state enums and update APIs | Shows progress; asks the user for input; starts the negotiated auth flow; distinguishes success from failure |
+| Outputs | Parses Artifacts and their Parts | Preserves all outputs, renders supported content and validates any agreed business schema |
+| Observation | Provides send, subscribe and get APIs | Chooses connection/callback/polling policy, bounds waits and reconciles missing updates |
 
-The report request below shows who owns each ID as the stream pauses and resumes. The follow-up is a new Message on the existing Task; a broken SSE connection instead calls `SubscribeToTask` with the captured Task ID.
+The SDK does not decide which question a human should answer or which Artifact is your chart. Those are application decisions. The [pinned BaseClient implementation](https://github.com/a2aproject/a2a-python/blob/v1.1.2/src/a2a/client/base_client.py) normalizes transport output, not the conversation's business workflow.
+
+## 5. One Consumer for Snapshots and Events
+
+A non-streaming send can yield only one `task` snapshot, already completed or waiting for input. A subscription starts with a snapshot too. If your consumer only saves IDs in the `task` branch and waits for a later `status_update`, it can miss the only question or output it will ever receive.
+
+Use the application-owned [client_workflow.py](../examples/python/client_workflow.py) adapter for the following excerpts. `ClientView` tracks one interaction/Task; keep the longer-lived conversation context in your application separately. Its `apply()` handles all four payloads:
+
+| Payload | State/output action |
+|---|---|
+| `message` | Save context and every Message Part; finish the direct exchange |
+| `task` | Save identity, inspect status/question, replace local Artifacts with the authoritative snapshot |
+| `status_update` | Apply state and optional status Message; do not assume only terminal states matter |
+| `artifact_update` | Replace or append the output identified by `artifact_id`; keep other Artifacts separate |
+
+The consumer first selects the payload, then interprets Task state. Follow the two separate decisions below; an Artifact chunk alone does not declare success.
 
 ```mermaid
-sequenceDiagram
-  participant C as Python client
-  participant A as A2A server
-  participant T as Task store
-  C->>A: SendMessage(messageId=m1, "Generate report")
-  A->>T: create task t1 in context c1
-  A-->>C: Task(t1,c1), WORKING, artifact chunk
-  A-->>C: INPUT_REQUIRED(t1,c1)
-  C->>A: SendMessage(messageId=m2, taskId=t1, contextId=c1)
-  A->>T: resume t1
-  A-->>C: COMPLETED(t1,c1) + report Artifact
+flowchart TD
+  A[SDK StreamResponse] --> B{Payload field}
+  B -->|message| C[Save context and render Message Parts]
+  B -->|task| D[Replace snapshot outputs and apply status]
+  B -->|status_update| E[Apply status and question]
+  B -->|artifact_update| F[Merge Parts by Artifact ID]
+  D --> G{Task state}
+  E --> G
+  G -->|Interrupted| H[Ask for input or complete external auth]
+  G -->|Terminal| I[Show success or failure with available outputs]
+  G -->|Active or unknown| J[Continue bounded observation]
+  F --> J
 ```
 
-The client saves `t1` and `c1` from the server's first response. At `INPUT_REQUIRED`, new user content belongs in `m2`, with both IDs echoed; the store can then continue `t1`. If SSE drops while the Task is still working, `subscribe(t1)` observes existing work without creating a second Task. If the client never received `t1`, it cannot safely assume a retry is idempotent.
+A completed snapshot can reach the terminal branch without a later update. An input-required snapshot can reach the question branch the same way. The renderer then walks every output Part rather than assuming that the first Part is text.
+
+This excerpt can consume `client.send_message(...)` or a subscription. It runs inside an async caller with a configured `client` and `request`:
 
 ```python
-from dataclasses import dataclass
+from examples.python.client_workflow import ClientView, consume, render_parts
 
-from a2a.types import TaskState
-
-
-@dataclass
-class StreamProgress:
-    task_id: str = ""
-    context_id: str = ""
-
-
-async def run_streaming(client, request, progress: StreamProgress):
-
-    async for event in client.send_message(request=request):
-        if event.HasField("task"):
-            # Initial snapshot — usually the first event of a long task.
-            progress.task_id = event.task.id
-            progress.context_id = event.task.context_id
-
-        elif event.HasField("status_update"):
-            upd = event.status_update          # TaskStatusUpdateEvent
-            progress.task_id, progress.context_id = upd.task_id, upd.context_id
-            print(f"state -> {TaskState.Name(upd.status.state)}")
-            if upd.status.state == TaskState.TASK_STATE_INPUT_REQUIRED:
-                return "needs_input"
-
-        elif event.HasField("artifact_update"):
-            upd = event.artifact_update        # TaskArtifactUpdateEvent
-            for part in upd.artifact.parts:
-                if part.text:
-                    print(part.text, end="", flush=True)
-            # `append` => concatenate onto a prior chunk; `last_chunk` => artifact done.
-
-        elif event.HasField("message"):
-            print("inline reply:", event.message.parts[0].text)
-
-    return "done"
+view = ClientView()
+outcome = await consume(
+    client.send_message(request=request), view, stop_on_interrupted=True
+)
+for line in render_parts(view.message_parts or view.status_parts):
+    print(line)
+for artifact_id, artifact in view.artifacts.items():
+    print(artifact_id, artifact.name or "(unnamed output)")
+    for line in render_parts(artifact.parts):
+        print(line)
+print("next action:", outcome)
 ```
 
-A typical long-task stream:
+The adapter reports `message`, `active`, `needs_input`, `needs_auth`, `completed`, `failed`, `canceled`, `rejected` or `unknown`; an iterator ending does not by itself prove successful completion. `completed` with no Artifacts is valid. In a live frontend, call `view.apply(event)` and publish the changed state on every event so progress appears immediately.
 
-```
-task            (status = TASK_STATE_SUBMITTED)
-status_update   (TASK_STATE_WORKING)
-artifact_update (append=False)            ← first chunk
-artifact_update (append=True)             ← more chunks
-artifact_update (append=True, last_chunk=True)
-status_update   (TASK_STATE_COMPLETED)    ← terminal
-```
+By default, `consume` drains through stream closure, retaining output even if it arrives after a status snapshot. `stop_on_interrupted=True` deliberately closes observation when a question or auth pause is seen, so this turn-based caller can act immediately. A subscription is not universally guaranteed to close at an interrupted state. A live UI can instead keep it open and handle the question concurrently; either approach must address the same Task when answering.
 
-`artifact_update.append` and `last_chunk` are the chunking protocol. Buffer per `artifact.artifact_id` or parallel artifacts will interleave.
+### Parts and Artifact identity determine rendering
 
-⚠️ **Connection drops mid-stream.** A long SSE connection *will* be cut by a proxy idle timeout or a network blip. The `async for` then raises `httpx.ReadError` / `httpx.RemoteProtocolError` — it does **not** end cleanly. Catch it and **resume** with `subscribe()` using the `task_id` you captured, rather than re-sending the message (which would start a *new* task):
+The generic renderer checks `Part.WhichOneof("content")`, so empty text and JSON `false` are still valid present content. It renders text and structured data, and describes URL/raw file content without fetching URLs. A production UI supplies its own rendering and download policy.
+
+Artifacts are stored by `artifact_id`, not by `name`: names can be missing or repeated. Each Artifact retains all Parts. For chunked updates, `append=False` replaces the base output and `append=True` adds Parts to that same output; `last_chunk` completes that Artifact, not the whole Task. An append with no known base needs snapshot reconciliation. Do not append a full Task snapshot to an existing partial buffer, or the displayed result will duplicate content.
+
+For a specialized report screen, agree the semantics and schema of summary/chart outputs with the agent, validate them, then map them to UI components. The generic fallback should still preserve an unknown output rather than silently discarding it.
+
+### Subscribe to known work, including after a disconnect
+
+With a known Task ID and streaming capability, this excerpt uses the same adapter for an initial subscription or reconnect:
 
 ```python
-import httpx
-from a2a.types import SubscribeToTaskRequest
+from examples.python.client_workflow import subscribe_or_get
 
-progress = StreamProgress()  # caller-owned: survives an exception inside the drain
-try:
-    status = await run_streaming(client, request, progress)
-except (httpx.ReadError, httpx.RemoteProtocolError):
-    if progress.task_id:                         # identity was captured before the drop
-        async for event in client.subscribe(
-            request=SubscribeToTaskRequest(id=progress.task_id)
-        ):
-            ...  # same StreamResponse handling as above
+# view.task_id was saved from a prior response or restored from application storage.
+outcome = await subscribe_or_get(client, view, stop_on_interrupted=True)
 ```
 
-If the connection fails before any Task or status event populates `progress.task_id`, there is no safe subscription target. Do not resend unless the server documents durable deduplication for the original `messageId`; surface the indeterminate outcome instead.
+The helper calls `client.subscribe(SubscribeToTaskRequest(id=view.task_id))`. On SDK 1.1.2's `UnsupportedOperationError`, it reads `GetTask`: a terminal/interrupted snapshot can be handled directly; an active snapshot re-raises the original unsupported-operation error. Authentication, inaccessible Task and network failures are not silently converted to success. See the [completion race](../02_protocol/04_streaming_and_push.md#completion-can-happen-between-the-two-requests).
+
+Bound the connection lifetime and reconnect attempts. After a network drop, preserve `view` and reconnect with backoff; do not resend the original Message just to observe it again. If the drop happens before you know a Task ID, the outcome is indeterminate unless the server documents durable deduplication for the original Message ID. A subscription snapshot replaces local partial outputs; it does not promise replay of every missed event.
 
 ---
 
 ## 6. Polling a Non-Streaming Task
 
-Not every agent streams, and not every caller wants a held-open connection. Set `ClientConfig.polling=True`: the client sends `return_immediately`, so `send_message()` yields once with the *initial* `Task`, then you poll `get_task()` yourself.
+To obtain an early Task response and poll it yourself, set **both** `ClientConfig(streaming=False, polling=True)`. The first disables the streaming path even when the card supports it; the second makes the SDK request `returnImmediately`. Otherwise `polling=True` alone does not guarantee that `send_message()` uses non-streaming transport.
+
+This async excerpt uses the bounded helper from the same adapter:
 
 ```python
-import asyncio
-from a2a.types import GetTaskRequest, TaskState
+from a2a.types import StreamResponse
+from examples.python.client_workflow import ClientView, consume, poll_task
 
-TERMINAL = {
-    TaskState.TASK_STATE_COMPLETED,
-    TaskState.TASK_STATE_FAILED,
-    TaskState.TASK_STATE_CANCELED,
-    TaskState.TASK_STATE_REJECTED,
-}
-
-async def poll_until_done(client, task_id, *, interval=2.0, max_wait=300.0):
-    """Poll GetTask until the task reaches a terminal or input-required state."""
-    waited = 0.0
-    while waited < max_wait:
-        task = await client.get_task(request=GetTaskRequest(id=task_id))
-        state = task.status.state
-        if state in TERMINAL or state == TaskState.TASK_STATE_INPUT_REQUIRED:
-            return task
-        await asyncio.sleep(interval)
-        waited += interval
-    raise TimeoutError(f"task {task_id} not done after {max_wait}s")
+view = ClientView()
+outcome = await consume(client.send_message(request=request), view)
+if outcome in {"active", "unknown"} and view.task_id:
+    task = await poll_task(client, view.task_id, interval=2.0, max_wait=300.0)
+    view.apply(StreamResponse(task=task))
+    outcome = view.outcome
 ```
 
-Handling `input-required` — the agent paused and needs more from you. Send a follow-up `Message` carrying the **same `task_id` and `context_id`** so the agent resumes the existing task instead of opening a new one:
+`poll_task` bounds total time, including RPC waits, and returns for **both** interrupted states as well as all terminal states. Returning an interrupted Task hands control back to the application; it does not mark work done. Continuing to poll `AUTH_REQUIRED` until timeout would hide the action that the user needs to take. For long-lived applications, choose backoff/jitter and an observation budget appropriate to the workflow; the example uses a fixed positive interval for clarity.
+
+### Answer the existing Task, then keep conversation continuity
+
+A clarification is new content, so send a new Message with the existing Task ID. The following excerpt deliberately omits context to show server inference:
 
 ```python
 from uuid import uuid4
 from a2a.types import Message, Part, Role, SendMessageRequest
+from examples.python.client_workflow import ClientView, consume
 
-async def answer_input_required(client, task, answer: str):
-    followup = Message(
-        role=Role.ROLE_USER,
-        message_id=f"msg-{uuid4()}",
-        task_id=task.id,                # <-- resumes THIS task
-        context_id=task.context_id,     # <-- keeps the conversation thread
-        parts=[Part(text=answer)],
-    )
-    async for event in client.send_message(
-        request=SendMessageRequest(message=followup)
-    ):
-        if event.HasField("task"):
-            return event.task
+followup = SendMessageRequest(message=Message(
+    message_id=f"msg-{uuid4()}",
+    role=Role.ROLE_USER,
+    task_id=view.task_id,
+    parts=[Part(text="October 2026")],
+))
+next_view = ClientView()
+outcome = await consume(
+    client.send_message(request=followup), next_view, stop_on_interrupted=True
+)
 ```
 
-> **Rule**: `context_id` is the conversation thread; `task_id` is the unit of work. Drop either on a follow-up and the agent treats your message as a brand-new request — losing all prior context. The agent assigns both on the first response; **you echo them back**, never invent them.
+Supplying the matching `context_id=view.context_id` is also valid. Dropping only the context does not lose the Task; dropping the Task ID means the Message no longer addresses that waiting work. If both are supplied, they must agree. A new view isolates one turn's outputs from another's; persist the returned context in the surrounding application.
 
-❌ Dropping the ids — the agent forgets everything and starts over:
+Once a Task completes, send another interaction in that conversation without its `task_id`. Here the application asks for a revision and references the previous result:
 
 ```python
-followup = Message(role=Role.ROLE_USER, message_id=str(uuid4()),
-                   parts=[Part(text=answer)])   # no task_id, no context_id
+revision = SendMessageRequest(message=Message(
+    message_id=f"msg-{uuid4()}",
+    role=Role.ROLE_USER,
+    context_id=next_view.context_id,
+    reference_task_ids=[next_view.task_id],
+    parts=[Part(text="Add a regional breakdown to that report")],
+))
 ```
+
+The server can return a direct Message or allocate a different Task. The completed Task cannot reopen. For a follow-up after a direct Message, reuse `view.context_id` without a Task reference, since no Task existed. Retained history and access to references depend on the agent's policy, not on the SDK keeping an HTTP client open.
 
 ---
 
@@ -433,7 +431,9 @@ followup = Message(role=Role.ROLE_USER, message_id=str(uuid4()),
 
 Outgoing calls are authenticated with **interceptors**. `AuthInterceptor` reads the resolved card's `security_schemes` / `security_requirements` and attaches the right header per scheme — Bearer for `http`/`oauth2`/`openIdConnect`, an API-key header for `apiKey`.
 
-It pulls the secret from a `CredentialService` you implement. `InMemoryContextCredentialStore` is the built-in, session-keyed implementation:
+It pulls the secret from a `CredentialService` you implement. `InMemoryContextCredentialStore` is the built-in, session-keyed implementation. Your application supplies this `sessionId`; the store reads it from `ClientCallContext.state` to find credentials. It is not the Message's `context_id`, does not allocate a conversation and need not have the same value. This is [local SDK behavior](https://github.com/a2aproject/a2a-python/blob/v1.1.2/src/a2a/client/auth/credentials.py), not an A2A wire field.
+
+For example, application session `app-42` may own report contexts `ctx-sales-001` and `ctx-sales-002`, while both calls use credential lookup key `credentials-42`. Keep those mappings in the backend under the authenticated caller; a context ID alone is not authorization.
 
 ```python
 import os
@@ -445,7 +445,7 @@ from a2a.client import (
 # 1. Stock the store: keyed by sessionId, then by the card's security-scheme name.
 store = InMemoryContextCredentialStore()
 await store.set_credentials(
-    session_id="session-abc",
+    session_id="credentials-42",
     security_scheme_name="bearerAuth",        # MUST match a key in card.security_schemes
     credential=os.environ["A2A_BEARER_TOKEN"], # raw token; never log or hard-code it
 )
@@ -454,7 +454,7 @@ await store.set_credentials(
 client = factory.create(card, interceptors=[AuthInterceptor(store)])
 
 # 3. Each call carries a context whose state names the session to look up.
-ctx = ClientCallContext(state={"sessionId": "session-abc"}, timeout=30.0)
+ctx = ClientCallContext(state={"sessionId": "credentials-42"}, timeout=30.0)
 async for event in client.send_message(request=request, context=ctx):
     ...
 ```
@@ -501,171 +501,35 @@ For OAuth2 client-credentials flows, token caching, and per-scope tokens, see **
 
 ---
 
-## 8. Complete Example
+## 8. Run the Client Workflow
 
-Discover an agent, send a streaming task, handle an `input-required` pause, and resume — production shape with an owned `httpx` client, timeouts, auth, and a bounded retry on resolution.
+### Local response and recovery scenarios
 
-```python
-"""a2a_client_demo.py — discover, send, stream, resume an A2A task."""
-import asyncio
-from dataclasses import dataclass
-import os
-from uuid import uuid4
+Run the complete [client_flow_demo.py](../examples/python/client_flow_demo.py) from the repository root:
 
-import httpx
-
-from a2a.client import (
-    A2ACardResolver, ClientFactory, ClientConfig,
-    AuthInterceptor, CredentialService,
-    AgentCardResolutionError, A2AClientError,
-)
-from a2a.types import (
-    Message, Part, Role, SendMessageRequest, SubscribeToTaskRequest, TaskState,
-)
-from a2a.utils import TransportProtocol
-
-AGENT_URL = "https://agent.example.com"
-
-TERMINAL = {
-    TaskState.TASK_STATE_COMPLETED, TaskState.TASK_STATE_FAILED,
-    TaskState.TASK_STATE_CANCELED, TaskState.TASK_STATE_REJECTED,
-}
-
-
-class SchemeCredentialService(CredentialService):
-    def __init__(self, credentials: dict[str, str]):
-        self._credentials = credentials
-
-    async def get_credentials(self, security_scheme_name, context):
-        if security_scheme_name not in self._credentials:
-            raise RuntimeError(f"No credential for {security_scheme_name!r}")
-        return self._credentials[security_scheme_name]
-
-
-@dataclass
-class StreamProgress:
-    task_id: str = ""
-    context_id: str = ""
-
-
-def user_message(text: str, *, task_id: str = "", context_id: str = "") -> SendMessageRequest:
-    """Build a SendMessageRequest. Echo task_id/context_id to continue a task."""
-    return SendMessageRequest(
-        message=Message(
-            role=Role.ROLE_USER,
-            message_id=f"msg-{uuid4()}",
-            task_id=task_id,            # empty string => new task
-            context_id=context_id,
-            parts=[Part(text=text)],
-        )
-    )
-
-
-async def drain_stream(stream, progress: StreamProgress) -> str:
-    """Consume an event stream while exposing captured identity to the caller."""
-    async for event in stream:
-        if event.HasField("task"):
-            progress.task_id = event.task.id
-            progress.context_id = event.task.context_id
-
-        elif event.HasField("status_update"):
-            upd = event.status_update
-            progress.task_id, progress.context_id = upd.task_id, upd.context_id
-            state = upd.status.state
-            print(f"  [status] {TaskState.Name(state)}")
-            if state == TaskState.TASK_STATE_INPUT_REQUIRED:
-                return "needs_input"
-            if state in TERMINAL:
-                return "done"
-
-        elif event.HasField("artifact_update"):
-            for part in event.artifact_update.artifact.parts:
-                if part.text:
-                    print(f"  [artifact] {part.text}")
-
-        elif event.HasField("message"):
-            print(f"  [reply] {event.message.parts[0].text}")
-            return "done"
-
-    return "stream_ended"
-
-
-async def resolve_with_retry(resolver: A2ACardResolver, attempts: int = 3):
-    """Resolve the card with a bounded exponential backoff on transient failure."""
-    for attempt in range(1, attempts + 1):
-        try:
-            return await resolver.get_agent_card()
-        except AgentCardResolutionError as e:
-            if attempt == attempts:
-                raise
-            backoff = 2 ** attempt
-            print(f"resolve failed ({e}); retry in {backoff}s")
-            await asyncio.sleep(backoff)
-
-
-async def main() -> None:
-    # One httpx client for the whole session: card fetch + every RPC. Always timed.
-    async with httpx.AsyncClient(timeout=30.0) as http:
-        # 1. Discover the agent.
-        resolver = A2ACardResolver(httpx_client=http, base_url=AGENT_URL)
-        card = await resolve_with_retry(resolver)
-        print(f"Discovered: {card.name} (streaming={card.capabilities.streaming})")
-
-        # 2. Build a transport-agnostic client with auth wired in.
-        config = ClientConfig(
-            httpx_client=http,
-            streaming=card.capabilities.streaming,   # stream only if the agent can
-            supported_protocol_bindings=[
-                TransportProtocol.JSONRPC, TransportProtocol.HTTP_JSON,
-            ],
-        )
-        factory = ClientFactory(config)
-        credential_service = SchemeCredentialService({
-            "bearerAuth": os.environ["A2A_BEARER_TOKEN"],
-        })
-        client = factory.create(card, interceptors=[AuthInterceptor(credential_service)])
-
-        async with client:                          # closes transport on exit
-            # 3. Send the initial task and stream its events.
-            print("Sending task...")
-            progress = StreamProgress()
-            try:
-                outcome = await drain_stream(
-                    client.send_message(request=user_message(
-                        "Generate a Q3 revenue report for the EMEA region."
-                    )), progress
-                )
-            except (httpx.ReadError, httpx.RemoteProtocolError) as e:
-                # 3b. Connection dropped mid-stream — resume, don't re-send.
-                if not progress.task_id:
-                    raise RuntimeError("stream outcome unknown; no task id captured") from e
-                print(f"stream dropped ({e}); resubscribing to {progress.task_id}")
-                outcome = await drain_stream(
-                    client.subscribe(request=SubscribeToTaskRequest(id=progress.task_id)),
-                    progress,
-                )
-
-            # 4. Handle an input-required pause with a follow-up on the SAME ids.
-            if outcome == "needs_input":
-                print(f"Agent needs input on task {progress.task_id}")
-                outcome = await drain_stream(
-                    client.send_message(request=user_message(
-                        "Use calendar quarters; revenue in EUR.",
-                        task_id=progress.task_id, context_id=progress.context_id,
-                    )), progress
-                )
-
-            print(f"Final outcome: {outcome} (task {progress.task_id or 'n/a'})")
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except A2AClientError as e:
-        print(f"A2A call failed: {e}")
+```bash
+uv run --with 'a2a-sdk==1.1.2' python -m examples.python.client_flow_demo
 ```
 
-> **Rule**: Wrap the `Client` in `async with` (or call `await client.close()`). It owns transport-level resources — gRPC channels, SSE connections — that leak if you don't release them.
+It uses real SDK protobuf objects and a scripted fake client to exercise direct replies, context-only follow-up, one/multiple/missing-name outputs, a paused Task answered by Task ID, completed-task references, chunk/snapshot reconciliation, subscription completion races and interrupted polling. It also calls the real SDK `BaseClient` non-streaming wrapper to verify that one completed or input-required snapshot is enough for the consumer. A real JSON-RPC/SSE transport over `httpx.MockTransport` verifies wrapped connection failures, reconnect without resending, terminal-subscription recovery, and propagation of HTTP/authentication errors. Assertions fail if output or routing decisions differ from the scenario.
+
+This is a local client-behavior fixture: it checks selected SDK serialization/parsing paths against scripted HTTP responses, but does not start a remote agent or verify actual webhook delivery or worker durability. The [transport chapter](../02_protocol/02_transport_and_rpc.md) supplies the complete JSON-RPC examples; the server and production chapters own those other boundaries.
+
+### Connect the same consumer to an agent
+
+Start the echo server from [Building a Server](02_building_a_server.md), then run the complete [report_client.py](../examples/python/report_client.py):
+
+```bash
+uv run --with 'a2a-sdk==1.1.2' python -m examples.python.report_client
+```
+
+The default URL is `http://127.0.0.1:9999`; set `A2A_AGENT_URL` to another agent URL when you intend to call it. The echo server only echoes the report request: it does not generate a report or ask a month. The local scripted fixture above supplies those controlled variants.
+
+The network client owns its HTTP resources, retries card resolution within a bound, selects streaming only if supported, handles snapshots and events with the same adapter, and observes active work by subscription or polling. It deliberately closes observation at an input/auth pause. Input-required displays the actual question and prompts for a new answer on the same Task; auth-required returns control for the negotiated external flow without sending a token in text. It caps each observation and the number of clarification turns.
+
+For an authenticated remote agent, configure the card's schemes using the credential approach in section 7 before sending; the local network demo intentionally uses the unauthenticated echo baseline. Unknown outcomes and errors remain visible rather than being printed as successful completion. Reconnection is bounded and never resends the original user content merely to recover observations. SDK 1.1.2 wraps HTTP request failures in `A2AClientError`; the example checks for an `httpx.RequestError` cause (or SDK timeout) before retrying, so authentication, HTTP-status and decoding errors remain distinct.
+
+> **Rule**: Wrap the `Client` in `async with` (or call `await client.close()`). Transport resources such as HTTP sessions, gRPC channels and SSE connections need explicit ownership and cleanup.
 
 ---
 
@@ -673,11 +537,11 @@ if __name__ == "__main__":
 
 | Mistake | Symptom | Fix |
 |---|---|---|
-| Treating the response as always a `Task` | `AttributeError` on `event.task.id` for a `message` reply | Branch on `event.HasField("message" / "task")` every time |
-| Dropping `context_id` / `task_id` on a follow-up | Agent ignores history, starts a fresh task | Echo both ids from the prior response into the new `Message` |
+| Treating the response as always a `Task` | Empty/default Task ID is used for a direct reply | Inspect the response oneof before reading Task fields |
+| Sending only context to answer a waiting Task | Original Task is not selected | Send its `task_id`; context is inferred if omitted and must match if supplied |
 | No `timeout` on `httpx.AsyncClient` | A hung agent hangs your process forever | `httpx.AsyncClient(timeout=30.0)`; set `ClientCallContext.timeout` per call |
 | No retry on card resolution | One transient `5xx`/DNS blip aborts the run | Bounded exponential backoff around `get_agent_card()` |
-| Not handling a mid-stream drop | `httpx.ReadError` ends the `async for` uncleanly | Catch it, `subscribe()` with the captured `task_id` to resume |
+| Not handling a mid-stream drop | Iterator raises or ends without final state | Bound reconnects; subscribe to known Task, or GetTask if it has finished |
 | Re-sending the message to "retry" a stream | A duplicate task runs on the agent | Resume with `subscribe()`, never re-`send_message()` |
 | Letting the SDK create its own `httpx` client | No connection reuse; resources leak | Pass your own `httpx_client` into `ClientConfig` and reuse it |
 | Not closing the `Client` | Leaked gRPC channels / open SSE sockets | `async with client:` or `await client.close()` |
@@ -693,7 +557,7 @@ if __name__ == "__main__":
 ## Recap, check yourself, and try it
 
 - Resolve the card, select a compatible transport, then inspect the response oneof before reading Message or Task fields.
-- Save the server-issued `task_id` and `context_id`. A follow-up input Message echoes both; a reconnect subscribes to the existing Task ID.
+- Save context from both direct Messages and Tasks. A Task continuation needs its `task_id`; matching context is optional. A reconnect observes the existing Task.
 - A drop before Task identity is known leaves the result indeterminate unless the server promises durable deduplication.
 - Bound waits and close the client so network failures and resources have explicit ends.
 
@@ -705,10 +569,26 @@ No. Resending may create another Task. Call `subscribe(SubscribeToTaskRequest(id
 
 </details>
 
-**Try it:** in the reconnect excerpt above, replace `...` with handling that prints the terminal Task state while retaining the captured ID. Hint: use `event.HasField("task")` and `TaskState.Name` as in the opening client.
+**Q: A non-streaming call yields one Task snapshot in `INPUT_REQUIRED` and then ends. Should you wait for a `status_update` before showing the question?**
+
+<details><summary>Answer</summary>
+
+No. Inspect the snapshot's state and `status.message` immediately. The snapshot may be the only item; answer with a new Message carrying that Task ID. The same logic must render Artifacts in a single completed snapshot.
+
+</details>
+
+**Q: Two Artifacts share the name `summary`, and a third has no name. Can a dictionary keyed by name represent all outputs?**
+
+<details><summary>Answer</summary>
+
+No. Names are optional labels. Key outputs by Artifact ID within their Task and preserve every Part. Only a separately agreed application schema can assign special meaning to a particular output.
+
+</details>
+
+**Try it:** extend the local fixture with a Task that completes after the initial response but before subscription. Supply the terminal snapshot and one Artifact; assert that the client reads the existing Task and never sends the report content again. Hint: use `UnsupportedOperationError` plus `GetTask`.
 
 <details><summary>Worked solution</summary>
 
-Inside the subscription loop, use `if event.HasField("task"): print(TaskState.Name(event.task.status.state))` and also inspect `status_update` events for a terminal state. Keep `progress.task_id` across the exception. This observes `t1`; it does not call `send_message` again.
+Make the scripted subscription raise `UnsupportedOperationError`, and have its next GetTask return the completed Task with the Artifact. Call `subscribe_or_get` on a view containing the original Task ID. Assert `outcome == "completed"`, the Artifact is present, and no new send was recorded. The fixture contains the worked version; it observes existing work instead of allocating another Task.
 
 </details>

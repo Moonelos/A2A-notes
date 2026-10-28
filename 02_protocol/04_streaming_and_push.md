@@ -6,6 +6,8 @@ A synchronous `SendMessage` works only when the agent finishes before the HTTP r
 
 ---
 
+If you cannot yet picture what the client sends or what arrives on the open response, read [Follow the Messages](00_client_server_walkthrough.md) first. It shows the complete request, annotated frames, a real local server/client, and how custom progress fits inside standard events.
+
 ## 1. SSE Streaming with `SendStreamingMessage`
 
 `SendStreamingMessage` initiates or continues a task and keeps the HTTP response open as a `text/event-stream`. Instead of one final JSON-RPC response, the server emits a sequence of Server-Sent Events, each carrying a JSON-RPC 2.0 success response whose `result` is a `StreamResponse` with exactly one oneof field:
@@ -21,7 +23,7 @@ Each streaming response object MUST contain exactly one of these. The stream fol
 
 ```
 Message-only:   message → [stream closes]
-Task lifecycle: task → statusUpdate* → artifactUpdate* → terminal/interrupted statusUpdate → [stream closes]
+Task lifecycle: task → [statusUpdate / artifactUpdate]* → terminal/interrupted statusUpdate → [stream closes]
 ```
 
 Two pieces drive client logic:
@@ -48,22 +50,109 @@ data: {"jsonrpc":"2.0","id":"req-1","result":{"statusUpdate":{"taskId":"t-9f3","
 
 ---
 
-## 2. Resubscribing with `SubscribeToTask`
+### Custom progress is data inside an event
 
-An SSE connection is a live TCP stream. It breaks for ordinary reasons — load balancer idle timeouts, mobile network handoffs, laptop sleep. The task itself keeps running on the server; only the *delivery channel* is lost.
+Enabling `capabilities.streaming` permits streaming; it does not automatically forward LLM tokens, tool calls or framework callbacks. Your executor emits those observations deliberately through standard A2A carriers:
 
-`SubscribeToTask` re-attaches an SSE stream to an existing non-terminal task by `id`. The server returns the current task state first, then resumes emitting `statusUpdate` / `artifactUpdate` events until the stream ends.
+| Application observation | Standard carrier | Producer action |
+|---|---|---|
+| A stage/tool has completed | `statusUpdate` with `WORKING`, optional Message and namespaced metadata | `TaskUpdater.update_status(..., metadata=...)` |
+| New report text or a model text chunk | `artifactUpdate`, same Artifact ID across chunks | `add_artifact(..., append=False)` first, then `append=True` |
+| Structured result to retain with outputs | Artifact with structured `data` Part | Emit the result schema as output, then complete the Task when work is finished |
 
+A custom application name such as `step_completed` belongs inside the agreed metadata schema; it is not a fifth `StreamResponse` payload or a new SSE label that ordinary A2A clients know how to process. Event metadata alone is not a durable progress history. The [worked custom-progress example](00_client_server_walkthrough.md#4-add-custom-progress-without-inventing-a-fifth-a2a-payload) shows the exact wire object, server SDK calls and client decoding loop. Use [extension discovery/activation](05_extensions_and_custom_bindings.md#custom-progress-on-a-standard-stream) when the additional schema needs negotiated semantics across independent implementations.
+
+---
+
+## 2. Subscribing to Existing Work
+
+`SendStreamingMessage` sends content and starts receiving updates in the same call. `SubscribeToTask` sends no new user content: it attaches an observer to a Task that already exists. That can be the first subscription after a nonblocking send, a second observer, or a reconnect after a dropped stream. It does not execute or restart the work.
+
+### First subscription after a nonblocking send
+
+The client wants a report but does not want the initial HTTP request held open. It sends this JSON-RPC request with `A2A-Version: 1.0` to the card's advertised JSON-RPC URL:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-long-001",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "messageId": "msg-long-001",
+      "role": "ROLE_USER",
+      "parts": [{"text": "Generate a large sales report for October 2026"}]
+    },
+    "configuration": {"returnImmediately": true}
+  }
+}
 ```
-1. SendStreamingMessage  → task t-9f3, events flowing
-2. [connection drops mid-task]
-3. SubscribeToTask { "id": "t-9f3" }  → new text/event-stream
-4. server sends current task snapshot, then resumes updates
+
+This server creates work and returns a Task snapshot:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-long-001",
+  "result": {
+    "task": {
+      "id": "task-123",
+      "contextId": "ctx-sales-001",
+      "status": {"state": "TASK_STATE_WORKING"}
+    }
+  }
+}
 ```
 
-> **Rule**: Build resubscribe into the client from day one. Treat SSE drops as expected, not exceptional — retry with backoff, capped at the task's known max duration.
+The Task ID is `result.task.id`; there is no separate top-level `taskId`. The client saves the returned IDs and inspects the state. This example is working, but it must also accept submitted, interrupted or already-finished work. A direct Message is still possible; `returnImmediately` does not force Task creation and has no effect on a direct reply.
 
-⚠️ Subscribe gives you a fresh task snapshot plus future events. If the agent emitted artifact chunks while you were disconnected and they were not persisted into the `Task`, you may miss them. For artifacts that must survive a reconnect, fetch the full task with `GetTask` after subscribing rather than relying on replayed deltas alone.
+If the Task needs observation and the card declares `capabilities.streaming: true`, the client sends a second request:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-subscribe-001",
+  "method": "SubscribeToTask",
+  "params": {"id": "task-123"}
+}
+```
+
+The HTTP response has `Content-Type: text/event-stream`. Its first event contains the current Task snapshot; later events describe output and state changes. A short illustrative stream is:
+
+```text
+data: {"jsonrpc":"2.0","id":"req-subscribe-001","result":{"task":{"id":"task-123","contextId":"ctx-sales-001","status":{"state":"TASK_STATE_WORKING"}}}}
+
+data: {"jsonrpc":"2.0","id":"req-subscribe-001","result":{"artifactUpdate":{"taskId":"task-123","contextId":"ctx-sales-001","artifact":{"artifactId":"art-summary","parts":[{"text":"October sales: $150,000"}]},"lastChunk":true}}}
+
+data: {"jsonrpc":"2.0","id":"req-subscribe-001","result":{"statusUpdate":{"taskId":"task-123","contextId":"ctx-sales-001","status":{"state":"TASK_STATE_COMPLETED"}}}}
+```
+
+The `data:` lines above are SSE fields, separated by blank lines. The client accumulates Artifacts by ID and uses the Task state to decide whether to finish, request input or initiate authorization. An `INPUT_REQUIRED` notification needs an answer through a new `SendMessage` addressed to the same Task; listening alone cannot answer it. For a Task that is already interrupted in the initial snapshot, act on that snapshot immediately rather than waiting for a duplicate status update.
+
+### Completion can happen between the two requests
+
+The initial response and the subscription are not one atomic operation. The report can finish in the gap, as the diagram shows:
+
+```mermaid
+sequenceDiagram
+  participant C as Sales client
+  participant A as Report agent
+  C->>A: SendMessage(returnImmediately=true)
+  A-->>C: Task task-123, WORKING
+  A->>A: Complete task-123 and persist report
+  C->>A: SubscribeToTask(id=task-123)
+  A-->>C: UnsupportedOperationError (terminal Task)
+  C->>A: GetTask(id=task-123)
+  A-->>C: Task COMPLETED with persisted report
+```
+
+An already-terminal Task rejects `SubscribeToTask`. Recover its persisted state with `GetTask`; repeating the subscription or resending the report Message is not the recovery. A preliminary `GetTask` cannot remove the race because completion can happen just after that read. If a subscription error is due to missing capability, authorization or an unknown Task, handle that actual cause; do not classify every error as successful completion. These are the [normative subscription semantics](https://a2a-protocol.org/latest/specification/#316-subscribe-to-task).
+
+### Reconnect without restarting the Task
+
+An SSE connection can break after the client has already captured the Task ID. Reconnect with bounded backoff using `SubscribeToTask` on that ID. If the Task finished during the gap, use the same `GetTask` recovery branch above. If it is still running, the new subscription gives a current snapshot and future events.
+
+SSE is not a durable event log: missing deltas are not guaranteed to replay. Reconcile persisted Artifacts using the initial Task snapshot or `GetTask`, replacing the local output snapshot before applying subsequent deltas. Coordinate reads and buffering so an older read cannot overwrite newer events. A chunk the server never persisted cannot be recovered by reconnecting alone. The [Python client](../03_python/03_building_a_client.md) demonstrates snapshot and event handling; the [production continuation](../05_production/03_scaling_deployment.md#3-long-running-tasks--decouple-execution-from-the-request) explains durable execution and shared events.
 
 ---
 
@@ -189,25 +278,38 @@ For the full SSRF defense checklist (DNS-rebinding, IP-range blocklists, egress 
 
 ## 6. Choosing a Delivery Mechanism
 
-| Dimension              | `SendMessage` (sync) | `SendStreamingMessage` (SSE)   | Push notifications            |
-|------------------------|-----------------------|-------------------------------|-------------------------------|
-| Latency to first byte  | Full task duration    | Immediate, incremental        | Per-event, agent-initiated    |
-| Client stays connected | Yes, briefly          | Yes, for the whole task       | No — disconnects entirely     |
-| Best task length       | Seconds               | Seconds to minutes            | Minutes to hours              |
-| Client type            | Any                   | Long-lived process, browser   | Public backend, serverless, batch |
-| Incremental output     | No                    | Yes (chunked artifacts)       | Yes (per POST)                |
-| Infrastructure needed  | None                  | None                          | Public HTTPS endpoint         |
-| Capability flag        | (always available)    | `capabilities.streaming`      | `capabilities.pushNotifications` |
-| Recovery on drop       | Retry only under a known deduplication contract | `SubscribeToTask` | `GetTask` reconciliation; agent retries are optional |
+There are three update mechanisms: polling, streaming and push. Streaming has two entry operations, depending on whether the same call also sends user content.
 
-Decision shortcut:
+| Workflow | How observation starts | Connection / infrastructure | Required capability |
+|---|---|---|---|
+| Nonblocking send + polling | `SendMessage(returnImmediately=true)`, then bounded `GetTask(id)` calls | Short requests; client controls interval/backoff | No optional delivery capability |
+| Send and stream | `SendStreamingMessage` sends content and yields updates | Open SSE response for JSON-RPC/HTTP+JSON | `streaming` |
+| Subscribe to known work | `SendMessage(returnImmediately=true)`, then `SubscribeToTask(id)`; also useful for reconnects | Open SSE response; handle completion before subscription | `streaming` |
+| Push notifications | Register `CreateTaskPushNotificationConfig` for a Task, or include `configuration.taskPushNotificationConfig` in the send | Client backend owns a reachable HTTPS callback; no persistent observer connection | `pushNotifications` |
 
-- **Sub-second to a few seconds, simple request/reply** → `SendMessage`.
-- **Want progressive output and the client can hold a connection** → `SendStreamingMessage`.
-- **Client cannot stay connected, or the task runs for many minutes/hours** → push notifications.
-- **Can't hold a connection but the agent has no `pushNotifications`** → `SendMessage` then poll `GetTask` with backoff.
+Plain `SendMessage` without `returnImmediately` is blocking by default: it waits for a terminal or interrupted state, rather than providing an in-progress monitoring channel. It can still return a completed Task with Artifacts. `returnImmediately` is ignored by streaming operations.
 
-> **Key insight**: Delivery mechanisms do not change the authoritative state. Choose sync, stream, push, or polling for reachability and latency, then reconcile uncertainty against `GetTask`.
+Choose by reachability and the updates you need, not by a fixed duration cutoff. Polling can monitor an hours-long Task; streaming can monitor one as long as the client and infrastructure sustain the connection. Push is useful when a backend needs updates while the initiating client is offline. A browser or mobile app normally delegates webhook receipt to its backend.
+
+This decision tree keeps creation separate from monitoring:
+
+```mermaid
+flowchart TD
+  A[Send user content] --> B{Need live output on this call?}
+  B -->|Yes, streaming supported| C[SendStreamingMessage]
+  B -->|No| D[SendMessage with returnImmediately true]
+  D --> E{Response is a Task?}
+  E -->|No| F[Render Message and save context]
+  E -->|Yes| G{Can and want to hold a connection?}
+  G -->|Yes, streaming supported| H[SubscribeToTask]
+  G -->|No| I{Reachable callback and push supported?}
+  I -->|Yes| J[Push plus GetTask reconciliation]
+  I -->|No| K[GetTask polling with backoff]
+```
+
+Inspect a returned Task before choosing the next branch: terminal means render the available result, interrupted means take the required action, and active means observe progress. If push is required from the first moment, include the callback config in the initial send; registering it later cannot be assumed to replay earlier notifications. For polling in the SDK, set both `streaming=False` and `polling=True`; see the [Python polling example](../03_python/03_building_a_client.md#6-polling-a-non-streaming-task).
+
+`returnImmediately` changes when the response is delivered, not how durable execution is. The server SDK can run work asynchronously in process; surviving a process restart also requires persisted work/checkpoints and a recovery mechanism. A TaskStore row by itself does not schedule or resume execution. The [worker design](../05_production/03_scaling_deployment.md#3-long-running-tasks--decouple-execution-from-the-request) develops that boundary.
 
 ---
 
@@ -215,7 +317,7 @@ Decision shortcut:
 
 | Failure                        | Symptom                                   | Mitigation |
 |--------------------------------|-------------------------------------------|------------|
-| SSE connection drops mid-task  | Stream ends before a terminal/interrupted state | `SubscribeToTask` with backoff; `GetTask` to backfill missed artifacts |
+| SSE connection drops mid-task  | Stream ends before a terminal/interrupted state | `SubscribeToTask` with bounded backoff; if already terminal, `GetTask`; reconcile persisted Artifacts |
 | Webhook endpoint down          | Agent's POST fails or times out           | Retry policy is implementation-defined; client polls `GetTask` as the reliable reconciliation path |
 | Duplicate notifications        | Same event POSTed more than once          | Make webhook handling **idempotent** — dedupe on `taskId` + event identity (JWT `jti` if signed); a redelivered "completed" must be a no-op |
 | Out-of-order notifications     | `TASK_STATE_WORKING` arrives after `TASK_STATE_COMPLETED` | Trust task **state**, not arrival order — never regress a task from a terminal state; use timestamps in `TaskStatus` to discard stale events |
@@ -253,11 +355,19 @@ Keep `COMPLETED`. Delivery can reorder, whereas a terminal Task cannot regress. 
 
 </details>
 
+**Q: `SendMessage(returnImmediately=true)` returned a working Task, but the next `SubscribeToTask` rejects it as terminal. Should you resend the original Message?**
+
+<details><summary>Answer</summary>
+
+No. The Task completed between requests. Read the same Task ID with `GetTask` and inspect its terminal state and persisted outputs. Resending content can create duplicate work; a terminal-subscription error does not mean the original request was lost.
+
+</details>
+
 **Try it.** The backend loses its connection after receiving the first chunk of `a-1`. Write the recovery order. Hint: distinguish a live subscription from persisted Task state.
 
 <details><summary>Worked solution</summary>
 
-Reconnect with backoff using `SubscribeToTask` for `t-9f3`, then call `GetTask` and rebuild `a-1` from its persisted artifact. Continue consuming new events, deduping any overlap. If the server did not persist a missing chunk, report incomplete output rather than inventing it.
+Subscribe to `t-9f3` with bounded backoff. If it completed during the gap, read it with `GetTask` and render its persisted Artifacts. Otherwise replace local output with the new subscription snapshot and then apply future deltas. If an additional GetTask read is needed, coordinate it with incoming updates to avoid overwriting newer state. A chunk never persisted by the server cannot be recovered; report incomplete output rather than inventing it.
 
 </details>
 

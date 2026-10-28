@@ -74,7 +74,7 @@ In the JSON-RPC binding, every operation is invoked by a `method` string. These 
 | `GetTask` | Fetch the current state of a task by ID | `Task` |
 | `ListTasks` | Query multiple tasks with filtering / pagination | `ListTasksResponse` |
 | `CancelTask` | Request cancellation of a running task | `Task` (updated status) |
-| `SubscribeToTask` | Re-attach an SSE stream to an existing non-terminal task | Stream of `StreamResponse` objects |
+| `SubscribeToTask` | Attach or re-attach an SSE stream to an existing non-terminal task | Stream of `StreamResponse` objects |
 | `CreateTaskPushNotificationConfig` | Register a webhook config for task updates | `TaskPushNotificationConfig` |
 | `GetTaskPushNotificationConfig` | Retrieve a stored push-notification config | `TaskPushNotificationConfig` |
 | `ListTaskPushNotificationConfigs` | List all push-notification configs for a task | `ListTaskPushNotificationConfigsResponse` |
@@ -96,7 +96,7 @@ A `SendMessage` call carries a `SendMessageRequest` object. The `message` field 
 ```json
 {
   "jsonrpc": "2.0",
-  "id": "req-7f3a1c",
+  "id": "req-report-001",
   "method": "SendMessage",
   "params": {
     "message": {
@@ -104,7 +104,7 @@ A `SendMessage` call carries a `SendMessageRequest` object. The `message` field 
       "role": "ROLE_USER",
       "parts": [
         {
-          "text": "Convert 2 cups of flour to grams."
+          "text": "Generate a sales report for October 2026."
         }
       ]
     },
@@ -121,11 +121,11 @@ A `SendMessage` call carries a `SendMessageRequest` object. The `message` field 
 ```json
 {
   "jsonrpc": "2.0",
-  "id": "req-7f3a1c",
+  "id": "req-report-001",
   "result": {
     "task": {
-      "id": "task-9d2e44",
-      "contextId": "ctx-5510ab",
+      "id": "task-123",
+      "contextId": "ctx-sales-001",
       "status": {
         "state": "TASK_STATE_COMPLETED",
         "timestamp": "2026-05-18T14:03:21Z"
@@ -134,14 +134,14 @@ A `SendMessage` call carries a `SendMessageRequest` object. The `message` field 
         {
           "messageId": "msg-001",
           "role": "ROLE_USER",
-          "parts": [{ "text": "Convert 2 cups of flour to grams." }]
+          "parts": [{ "text": "Generate a sales report for October 2026." }]
         }
       ],
       "artifacts": [
         {
           "artifactId": "art-001",
-          "name": "conversion",
-          "parts": [{ "text": "2 cups of all-purpose flour is about 240 grams." }]
+          "name": "summary",
+          "parts": [{ "text": "October total sales: $150,000" }]
         }
       ]
     }
@@ -158,6 +158,78 @@ Notes on the shape:
 
 ---
 
+### Direct reply, one Artifact, or multiple Artifacts
+
+The completed Task above is one possible answer shape, even if the server finishes quickly. Execution duration does not determine the response type. A simple calculation can instead finish as a direct Message. Here is its complete exchange:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-math-001",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "messageId": "msg-math-001",
+      "role": "ROLE_USER",
+      "parts": [{"text": "What is 2 + 2?"}]
+    }
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-math-001",
+  "result": {
+    "message": {
+      "messageId": "msg-math-002",
+      "contextId": "ctx-math-001",
+      "role": "ROLE_AGENT",
+      "parts": [{"text": "2 + 2 = 4"}]
+    }
+  }
+}
+```
+
+The client reads `result.message.parts`, saves `ctx-math-001` for another conversation turn, and has no Task to poll. Server Messages carry their context even when no Task exists.
+
+If the report request also asks for a chart, a Task-producing server might return two Artifacts instead:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-report-001",
+  "result": {
+    "task": {
+      "id": "task-123",
+      "contextId": "ctx-sales-001",
+      "status": {"state": "TASK_STATE_COMPLETED"},
+      "artifacts": [
+        {
+          "artifactId": "art-summary",
+          "name": "summary",
+          "parts": [{"text": "Sales increased by 20%."}]
+        },
+        {
+          "artifactId": "art-chart",
+          "name": "chart",
+          "parts": [{"url": "https://example.com/chart.png", "mediaType": "image/png"}]
+        }
+      ]
+    }
+  }
+}
+```
+
+These responses illustrate alternative server behaviors; they are not three successive replies to one RPC. For a Task, inspect `status.state` before deciding the next action and render each returned Artifact's Parts. `INPUT_REQUIRED` means display the question and send a continuation; `COMPLETED` means successful work, with whatever outputs exist. Do not assume `[0]` is present or that `name` is unique. Output-specific routing needs an application agreement; protocol identity is `artifactId` within the Task.
+
+For ongoing work, the client sends `configuration.returnImmediately: true`, saves the returned Task ID, then chooses polling, subscription or push. The [complete nonblocking/subscription exchange](04_streaming_and_push.md#2-subscribing-to-existing-work) covers that fourth response case. The [report clarification exchange](03_task_lifecycle.md#one-report-through-a-pause-and-completion) shows a Task waiting for input.
+
+The [protocol response definitions](https://github.com/a2aproject/A2A/blob/v1.0.1/specification/a2a.proto) define the container shapes. Raw JSON clients first check the envelope for `error` or `result`; SDK clients receive typed results/events or exceptions. Neither should branch directly between a Message and an Artifact: a non-streaming success contains **Message or Task**, with Artifacts nested in the Task.
+
+---
+
 ## 4. The HTTP layer
 
 For the JSON-RPC binding, every method call is a single HTTP request:
@@ -170,7 +242,7 @@ Accept: application/json
 Authorization: Bearer <token>
 A2A-Version: 1.0
 
-{ "jsonrpc": "2.0", "id": "req-7f3a1c", "method": "SendMessage", "params": { ... } }
+{ "jsonrpc": "2.0", "id": "req-report-001", "method": "SendMessage", "params": { ... } }
 ```
 
 - **Method & URL**: always `POST` to the agent's `url` from the Agent Card. There is one endpoint; the JSON-RPC `method` field selects the operation — not the path.
@@ -198,7 +270,7 @@ A JSON-RPC error response replaces `result` with an `error` object:
 ```json
 {
   "jsonrpc": "2.0",
-  "id": "req-7f3a1c",
+  "id": "req-report-001",
   "error": {
     "code": -32001,
     "message": "Task not found",
@@ -249,7 +321,7 @@ A JSON-RPC error response replaces `result` with an `error` object:
       "@type": "type.googleapis.com/google.rpc.ErrorInfo",
       "reason": "TASK_NOT_CANCELABLE",
       "domain": "a2a-protocol.org",
-      "metadata": { "taskId": "task-9d2e44", "state": "TASK_STATE_COMPLETED" }
+      "metadata": { "taskId": "task-123", "state": "TASK_STATE_COMPLETED" }
     }
   ]
 }

@@ -1,0 +1,7 @@
+# Local review and authoring evidence
+/_audit/
+/_meta/
+
+# Python runtime files
+__pycache__/
+*.py[cod]
