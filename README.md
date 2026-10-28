@@ -165,7 +165,7 @@ The production notes include executable local proofs for owner-scoped JSON-RPC a
 
 ## Follow one client interaction
 
-Start with [Follow the Messages](02_protocol/00_client_server_walkthrough.md): one complete request-to-follow-up story, an annotated SSE stream, custom progress and a real local client/server lab.
+Start with [Follow the Messages](02_protocol/00_client_server_walkthrough.md): one complete request-to-follow-up story, an annotated SSE stream, custom progress and a real local client/server lab. For who writes which annotations, see [metadata ownership and propagation](01_fundamentals/02_core_concepts.md#metadata-who-writes-it-and-what-it-belongs-to).
 
 For the deeper request-to-follow-up reference path, start with [who creates each ID and what “session” means](01_fundamentals/02_core_concepts.md#who-creates-each-id), then read the [direct Message and Task response examples](02_protocol/02_transport_and_rpc.md#3-a-complete-json-rpc-requestresponse-pair), the [report clarification exchange](02_protocol/03_task_lifecycle.md#one-report-through-a-pause-and-completion), and [first subscription plus completion-race recovery](02_protocol/04_streaming_and_push.md#2-subscribing-to-existing-work). The [Python consumer and local scenarios](03_python/03_building_a_client.md#8-run-the-client-workflow) map those decisions to SDK 1.1.2.
 

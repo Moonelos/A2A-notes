@@ -29,15 +29,20 @@ def user_message(text, *, task_id="", context_id="", reference_task_ids=()):
     return Message(
         message_id=f"msg-{uuid4()}", role=Role.ROLE_USER, parts=[Part(text=text)],
         task_id=task_id, context_id=context_id, reference_task_ids=reference_task_ids,
+        metadata={"com.example.reportRequest.v1": {"requestTag": "ui-17"}},
     )
 
 
 async def run_turn(client, message: Message) -> ClientView:
     # This is the Message payload, not a hand-built JSON-RPC wire envelope.
     # The SDK selects SendMessage/SendStreamingMessage and creates its RPC ID.
+    request = SendMessageRequest(
+        message=message, metadata={"com.example.rpc.v1": {"traceTag": "rpc-demo-17"}},
+    )
+    print("SEND Request " + json.dumps(MessageToDict(request), ensure_ascii=False), flush=True)
     print("SEND Message " + json.dumps(MessageToDict(message), ensure_ascii=False), flush=True)
     view = ClientView()
-    stream = client.send_message(request=SendMessageRequest(message=message))
+    stream = client.send_message(request=request)
     try:
         async for event in stream:
             payload = event.WhichOneof("payload")

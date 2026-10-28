@@ -121,6 +121,42 @@ async def check_wire(http, url):
     assert artifact_text(final) == "October sales: $150,000."
     print("GetTask retrieves the persisted completed report: PASS", flush=True)
 
+    # Each metadata map has its own producer and object scope.
+    client_annotation = {"com.example.reportRequest.v1": {"requestTag": "ui-17"}}
+    operation_annotation = {"com.example.rpc.v1": {"traceTag": "rpc-demo-17"}}
+    annotated = message("msg-meta-001", "Generate a sales report for October 2026")
+    annotated["metadata"] = client_annotation
+    annotated_task = (await call(http, url, rpc("req-meta-001", "SendMessage", {
+        "message": annotated, "metadata": operation_annotation,
+    })))["task"]
+    result_metadata = {"com.example.reportResult.v1": {
+        "generator": "demo-report-v1", "requestTag": "ui-17",
+    }}
+    # SDK1.1.2 TaskManager merges server status-event metadata into Task.metadata.
+    result_metadata[PROGRESS_KEY] = {
+        "event": "step_completed", "step": "build_report", "completed": 2, "total": 2,
+    }
+    assert annotated_task["metadata"] == result_metadata, annotated_task["metadata"]
+    assert "com.example.reportRequest.v1" not in annotated_task["metadata"]
+    assert "com.example.rpc.v1" not in annotated_task["metadata"]
+    assert annotated_task["artifacts"][0]["metadata"] == {
+        "com.example.reportArtifact.v1": {"format": "plain-text"},
+    }
+    restored = await call(http, url, rpc("req-meta-get-001", "GetTask", {
+        "id": annotated_task["id"], "historyLength": 10,
+    }))
+    assert restored["metadata"] == result_metadata
+    assert restored["artifacts"][0]["metadata"] == annotated_task["artifacts"][0]["metadata"]
+    original = next(item for item in restored["history"] if item["messageId"] == "msg-meta-001")
+    assert original["metadata"] == client_annotation
+    # Earlier unannotated requests work; no implicit requestTag is fabricated.
+    assert "requestTag" not in final["metadata"]["com.example.reportResult.v1"]
+    # Event metadata is the server's progress convention, not merged request metadata.
+    assert all("com.example.rpc.v1" not in update.get("metadata", {}) for update in statuses)
+    assert all("com.example.reportResult.v1" not in update.get("metadata", {}) for update in statuses)
+    assert reply["metadata"] == {"com.example.reply.v1": {"source": "calculator"}}
+    print("metadata ownership, explicit selection and GetTask persistence: PASS", flush=True)
+
 
 async def check_clients(url):
     for scenario in ("stream", "conversation", "direct"):
@@ -140,6 +176,13 @@ async def check_clients(url):
         sent = [json.loads(line.removeprefix("SEND Message ")) for line in output.splitlines()
                 if line.startswith("SEND Message ")]
         assert len({item["messageId"] for item in sent}) == len(sent)
+        sent_requests = [json.loads(line.removeprefix("SEND Request ")) for line in output.splitlines()
+                         if line.startswith("SEND Request ")]
+        assert len(sent_requests) == len(sent)
+        assert all(item["metadata"] == {"com.example.rpc.v1": {"traceTag": "rpc-demo-17"}}
+                   for item in sent_requests)
+        assert all(item["metadata"] == {"com.example.reportRequest.v1": {"requestTag": "ui-17"}}
+                   for item in sent)
         if scenario == "stream":
             assert "RECEIVED status_update" in output and "PROGRESS " in output
             assert "ACCUMULATED art-report: October sales: \n" in output

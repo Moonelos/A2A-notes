@@ -131,6 +131,8 @@ uv add "a2a-sdk[http-server]==1.1.2"   # keep the teaching baseline pinned
 
 ---
 
+For incoming annotations, SDK1.1.2 exposes request `params.metadata` as `context.metadata` (a plain dict). The separate client Message annotations are in `context.message.metadata` (a protobuf Struct). Neither is automatically Task metadata. If you need a validated request label on returned work, explicitly assign it to `task.metadata` before publishing/persisting the Task. `TaskUpdater.update_status(metadata=...)` annotates the status **event**, while `TaskUpdater.add_artifact(metadata=...)` annotates the **Artifact**. The pinned server TaskManager additionally merges status-event metadata into stored Task metadata; this is SDK behavior, not automatic copying of client annotations or a durable event history. See the [ownership and propagation example](../01_fundamentals/02_core_concepts.md#metadata-who-writes-it-and-what-it-belongs-to) and the [live lab](../02_protocol/00_client_server_walkthrough.md#who-sets-the-metadata-in-these-examples).
+
 ## 2. Defining the Agent Card in code
 
 The **Agent Card** is the agent's public manifest. The SDK serves it automatically at `/.well-known/agent-card.json` so clients can discover capabilities before sending a message.

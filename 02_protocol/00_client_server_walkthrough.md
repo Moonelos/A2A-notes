@@ -333,6 +333,14 @@ await updater.complete()
 
 The first call creates the base Artifact; the second extends it. Omitting `artifact_id` on every call would allocate separate outputs. Starting with `append=True` does not create the missing base output. These are producer decisions, not features enabled merely by setting the card's streaming flag.
 
+### Who sets the metadata in these examples?
+
+Both sides can write metadata, but each object has its own map. The client can send `params.message.metadata` on its Message and a different `params.metadata` on the RPC. The report server creates `task.metadata`, `artifact.metadata` and progress-event metadata. The server can also send metadata on its own reply Messages; the same field name does not mean the client owns those maps.
+
+The [complete ownership example](../01_fundamentals/02_core_concepts.md#metadata-who-writes-it-and-what-it-belongs-to) shows one request and response side by side. In this lab, the client explicitly sends optional `requestTag="ui-17"` under `com.example.reportRequest.v1`. The server validates it and **deliberately copies** it to `task.metadata["com.example.reportResult.v1"]`, alongside its own `generator` label. It independently puts `format` on the Artifact and stage counters on status-update events. The RPC-level `traceTag` is not echoed into those output maps.
+
+The client logs both `SEND Request` and `SEND Message` so you can see which map is where. It explicitly sets annotations when constructing each new request; they are not inherited because a previous turn used them. Requests without the optional annotation still work. `GetTask` retrieves the Task/Artifact annotations. SDK1.1.2 also merges status-update metadata into Task metadata, so the final snapshot includes the last progress stage; it is not a complete archive of events. Selecting the client label and writing the output format are explicit lab policies. Merging status-event metadata into the stored Task is the separate pinned-SDK behavior described above; the lab does not implement extension negotiation.
+
 ### Read custom progress on the client while events arrive
 
 This async excerpt shows the important ordering: apply each event, inspect progress metadata when present, and update the display **inside** the loop. The complete runnable client adds request creation, discovery, all payload cases and bounded cleanup.
@@ -425,6 +433,7 @@ If the client cannot fetch the card, check that terminal 1 is running and port `
 - Send user content in a Message. New interaction, Task continuation and context-only follow-up use different identity fields.
 - A streaming request produces one open HTTP response containing multiple typed updates. It is not one HTTP request per token.
 - Progress is usually a status update; produced content is an Artifact update. The executor decides their granularity.
+- Both sides annotate their own objects. There is no general cross-object propagation rule; the pinned SDK separately merges status-event metadata into its Task snapshot.
 - Custom application events fit inside a standard carrier such as event metadata. A declared extension adds discoverable, negotiated semantics without a new core payload field.
 - Render while iterating. Preserve output by Artifact ID; `lastChunk` finishes an Artifact and `COMPLETED` finishes a Task.
 

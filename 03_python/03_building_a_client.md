@@ -289,6 +289,38 @@ async for event in client.send_message(request=request):
 
 The SDK does not decide which question a human should answer or which Artifact is your chart. Those are application decisions. The [pinned BaseClient implementation](https://github.com/a2aproject/a2a-python/blob/v1.1.2/src/a2a/client/base_client.py) normalizes transport output, not the conversation's business workflow.
 
+### Write and read the correct metadata map
+
+This request-construction excerpt sets two independent annotations. The namespace keys and values are application-defined:
+
+```python
+request = SendMessageRequest(
+    metadata={"com.example.rpc.v1": {"traceTag": "rpc-demo-17"}},
+    message=Message(
+        message_id=f"msg-{uuid4()}", role=Role.ROLE_USER,
+        parts=[Part(text="Generate a sales report for October 2026")],
+        metadata={"com.example.reportRequest.v1": {"requestTag": "ui-17"}},
+    ),
+)
+```
+
+`request.metadata` becomes JSON-RPC `params.metadata`; `request.message.metadata` becomes `params.message.metadata`. On the SDK1.1.2 server, `context.metadata` is a plain dictionary for the **request-level** map; `MessageToDict(context.message.metadata)` reads the separate Message-level protobuf Struct. The SDK does not combine them.
+
+The server may return its own Task/Artifact maps or event annotations. In the pinned server handler, status-event metadata is also merged into the stored Task metadata; interpret that latest-value snapshot according to the server contract, not as a complete event log. Client access stays explicit (excerpt inside the event loop):
+
+```python
+from google.protobuf.json_format import MessageToDict
+
+if event.HasField("task"):
+    task_annotations = MessageToDict(event.task.metadata)
+    for artifact in event.task.artifacts:
+        output_annotations = MessageToDict(artifact.metadata)
+elif event.HasField("status_update"):
+    update_annotations = MessageToDict(event.status_update.metadata)
+```
+
+Read an Artifact chunk's output metadata from `event.artifact_update.artifact.metadata`; `event.artifact_update.metadata` is a separate map about that event. The ordinary `ClientView` example stores outputs and state, but does not automatically promote arbitrary event metadata to persistent application state. Keep or interpret annotations deliberately if your workflow needs them. See [the complete client/server example](../01_fundamentals/02_core_concepts.md#metadata-who-writes-it-and-what-it-belongs-to) for explicit server selection/copying and [RequestContext's pinned implementation](https://github.com/a2aproject/a2a-python/blob/v1.1.2/src/a2a/server/agent_execution/context.py) for the SDK accessors.
+
 ## 5. One Consumer for Snapshots and Events
 
 A non-streaming send can yield only one `task` snapshot, already completed or waiting for input. A subscription starts with a snapshot too. If your consumer only saves IDs in the `task` branch and waits for a later `status_update`, it can miss the only question or output it will ever receive.

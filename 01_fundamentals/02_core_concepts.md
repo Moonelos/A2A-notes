@@ -268,6 +268,100 @@ Messages are how agents talk; Artifacts are what they produce. A Task's `history
 
 ---
 
+## Metadata: Who Writes It and What It Belongs To
+
+**Both client and server can set metadata. Each map belongs to the object carrying it.** A client may annotate its outgoing Message; the server may annotate its reply, Task, output or progress update. These are separate maps, even when their keys happen to have the same spelling.
+
+`metadata` is an optional JSON object: keys are strings and values may be strings, numbers, booleans, null, arrays or nested objects. Application code or a negotiated extension gives those keys meaning. The protocol does not automatically interpret a field such as `priority` or `requestTag`.
+
+| Field path | Who normally writes it? | What the annotation belongs to |
+|---|---|---|
+| `SendMessage` request `params.metadata` | Client | This operation/RPC request |
+| Request `params.message.metadata` | Client, as that Message's sender | The outgoing conversational turn |
+| Direct reply `result.message.metadata` or `task.status.message.metadata` | Server, as that Message's sender | That particular reply/status Message |
+| `result.task.metadata` | Server/application that owns the Task | The work object, not every Message in its history |
+| `task.artifacts[i].metadata` | Server/output producer | That deliverable |
+| `result.statusUpdate.metadata` or `result.artifactUpdate.metadata` | Server/event producer | That emitted update |
+| `parts[i].metadata` inside a Message or Artifact | Whoever builds that Part | That one piece of content |
+
+For streamed Artifacts, `result.artifactUpdate.artifact.metadata` annotates the **Artifact**, while `result.artifactUpdate.metadata` annotates the **update event**. `TaskStatus` itself has no `metadata` field; `statusUpdate.metadata` is a sibling of `status`, not a child of it. Likewise, a SendMessage success has `result.task` or `result.message`, not a shared `result.metadata` map. These locations follow the [canonical protocol definitions](https://github.com/a2aproject/A2A/blob/v1.0.1/specification/a2a.proto).
+
+### Follow one annotation from input to output
+
+The client tags this report request so its own UI can recognize it. It also puts a separate diagnostic tag on the operation. These are application-defined examples, not built-in A2A behaviors:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "rpc-meta-1",
+  "method": "SendMessage",
+  "params": {
+    "metadata": {"com.example.rpc.v1": {"traceTag": "rpc-demo-17"}},
+    "message": {
+      "messageId": "msg-meta-1",
+      "role": "ROLE_USER",
+      "parts": [{"text": "Generate a sales report for October 2026"}],
+      "metadata": {"com.example.reportRequest.v1": {"requestTag": "ui-17"}}
+    }
+  }
+}
+```
+
+This server chooses to validate `requestTag` and copy only that value into its own result annotation. It adds a generator label and annotates the output's format:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "rpc-meta-1",
+  "result": {
+    "task": {
+      "id": "task-meta-1",
+      "contextId": "ctx-meta-1",
+      "status": {"state": "TASK_STATE_COMPLETED"},
+      "metadata": {"com.example.reportResult.v1": {"requestTag": "ui-17", "generator": "demo-report-v1"}},
+      "artifacts": [{
+        "artifactId": "art-report",
+        "parts": [{"text": "October sales: $150,000."}],
+        "metadata": {"com.example.reportArtifact.v1": {"format": "plain-text"}}
+      }]
+    }
+  }
+}
+```
+
+The repeated `ui-17` is an **explicit application copy**. It does not prove that request and Task metadata share storage. The operation's `traceTag` is not echoed here, and the server's generator/format fields were never supplied by the client.
+
+Watch the decision between receipt and the response; that step is your server logic:
+
+```mermaid
+sequenceDiagram
+  participant C as Report client
+  participant S as Report server
+  C->>S: Message metadata requestTag=ui-17; separate RPC metadata
+  S->>S: Validate optional requestTag
+  S->>S: Explicitly select requestTag for Task result metadata
+  S-->>C: Task metadata requestTag plus server generator
+  S-->>C: Artifact metadata format; independent progress event metadata
+```
+
+The SDK serializes the maps and offers helper APIs. There is **no general A2A rule or SDK guarantee** that copies, merges or echoes `params.metadata` into `message.metadata`, `task.metadata`, Artifact metadata, every future event, or the next turn. If the server keeps the original client Message in Task history, its original `message.metadata` may be visible there; that is still the Message's annotation, not a copy into `Task.metadata`.
+
+SDK behavior can still implement a **specific** merge. In the pinned Python SDK1.1.2, server `TaskManager.save_task_event` merges `TaskStatusUpdateEvent.metadata` into the stored `Task.metadata`. Our lab therefore also returns `com.example.reportProgress.v1` with the last reported stage. A later update using that same namespace replaces its value; this is a latest-value snapshot, not an ordered event archive. This does not copy the client's Message/request metadata into the Task, and it is not a universal A2A rule. Recheck this [version-specific implementation](https://github.com/a2aproject/a2a-python/blob/v1.1.2/src/a2a/server/tasks/task_manager.py) when choosing another handler or SDK.
+
+Sending a new Message with `taskId` and different Message metadata does not itself patch `Task.metadata`; the server must implement and authorize any such behavior.
+
+Persistence follows the owning object and server policy. In the [live report lab](../02_protocol/00_client_server_walkthrough.md#who-sets-the-metadata-in-these-examples), Task/Artifact annotations can be read back with `GetTask` while the in-memory server is alive. The latest status metadata retained by this SDK is still not a stored timeline of every event. Put information that must survive observation gaps in documented persistent state.
+
+### Metadata is not headers, content or authority
+
+JSON `metadata` is different from HTTP headers, gRPC transport metadata and SDK-local `ClientCallContext.state`. For example, `A2A-Version` and `A2A-Extensions` are service parameters; putting similarly named keys in JSON metadata does not send those headers or activate an extension.
+
+Keep primary conversational content and report results in Parts, including structured `Part.data`; use metadata for annotations about a request, object or update. A specialized extension may define a particular metadata carrier, but both sides must agree its schema and behavior. Unknown annotations do not acquire meaning just because they parse as JSON.
+
+A client can submit an annotation such as `role: admin`, but it does not establish the caller's permissions. Validate any field that drives behavior against the authenticated caller and application policy. The same applies to server-supplied metadata consumed by a client: validate its expected schema before using it in the UI. The [metadata definition](https://a2a-protocol.org/latest/specification/#325-metadata) defines the carrier, not application trust or automatic propagation.
+
+---
+
 ## 8️⃣ Identity: From the First Request to the Next Turn
 
 Suppose the client asks for a sales report. Before receiving any reply it knows its outgoing Message, but it does not yet know whether the server will create a Task. Inventing a `taskId` would claim that a Task already exists. Instead, the first request normally omits both `taskId` and `contextId`; the response supplies the identity the client needs for later turns.
@@ -399,5 +493,13 @@ It is server-produced output, so it belongs in an Artifact Part on the Task. The
 <details><summary>Answer</summary>
 
 No. The existing `taskId` selects the Task, and the server infers its context. If you supply a different context alongside that Task ID, the server rejects the mismatch. Sending only the original context would preserve conversation grouping without selecting the waiting Task.
+
+</details>
+
+**Q: A client sends `params.message.metadata.requestTag = "ui-17"`. Must `result.task.metadata.requestTag` contain the same value?**
+
+<details><summary>Answer</summary>
+
+No. These maps annotate different objects. The server can validate and copy the value under an agreed application schema, but neither A2A nor the SDK promises that copy. Seeing the original Message annotation in Task history does not make it Task metadata either.
 
 </details>

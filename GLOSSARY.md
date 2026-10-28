@@ -13,6 +13,7 @@ Use these definitions for lookup after reading the linked lesson.
 | Context ID | Conversation grouping at a remote agent, distinct from Task, login and credential-session identity; see [Core Concepts](01_fundamentals/02_core_concepts.md#who-creates-each-id). |
 | Credential-store session ID | Application-supplied `ClientCallContext.state["sessionId"]` lookup key for SDK credentials; see [Python Client](03_python/03_building_a_client.md#7-passing-auth-credentials). |
 | Extension | Optional or required extra protocol behavior activated through a negotiated URI; see [Extensions](02_protocol/05_extensions_and_custom_bindings.md). |
+| Metadata | Optional JSON annotations on a particular object; its producer sets them, and propagation to other objects needs an explicit policy; see [ownership and scopes](01_fundamentals/02_core_concepts.md#metadata-who-writes-it-and-what-it-belongs-to). |
 | Message | One conversational turn sent by client or server, containing Parts; see [Core Concepts](01_fundamentals/02_core_concepts.md). |
 | Part | One unit of text, file, or structured content inside a Message or Artifact; see [Core Concepts](01_fundamentals/02_core_concepts.md). |
 | Polling | Periodic `GetTask` reads of existing work, with bounded waits and a policy for interrupted states; see [Python Client](03_python/03_building_a_client.md#6-polling-a-non-streaming-task). |
