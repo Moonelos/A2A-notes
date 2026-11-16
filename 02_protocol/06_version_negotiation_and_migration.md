@@ -13,9 +13,66 @@ POST /message:send HTTP/1.1
 Host: agent.example
 A2A-Version: 1.0
 Content-Type: application/a2a+json
+Authorization: Bearer <a2a-client-token>
+
+{"message":{"messageId":"msg-version-1","role":"ROLE_USER","parts":[{"text":"What is 2 + 2?"}]}}
 ```
 
 The server either processes that version or returns the binding-specific `VersionNotSupportedError`. Clients must not retry the same interface without a version or reinterpret a 1.0 response as 0.3.
+
+### What the version failure actually looks like
+
+Suppose this HTTP+JSON interface accepts `1.0`, but a test client changes only the header above to `A2A-Version: 0.5`. A representative version failure is:
+
+```http
+HTTP/1.1 400 Bad Request
+Content-Type: application/a2a+json
+
+{
+  "error": {
+    "code": 400,
+    "status": "FAILED_PRECONDITION",
+    "message": "Requested A2A version 0.5 is not supported",
+    "details": [{
+      "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+      "reason": "VERSION_NOT_SUPPORTED",
+      "domain": "a2a-protocol.org"
+    }]
+  }
+}
+```
+
+This follows the [1.0 HTTP+JSON error binding](https://a2a-protocol.org/v1.0.0/specification/#116-error-handling) and [SDK 1.1.2 error serializer](https://github.com/a2aproject/a2a-python/blob/v1.1.2/src/a2a/utils/error_handlers.py), checked 2026-11-16: `error.code` is the HTTP numeric code and `status` carries the mapped status name. The human wording is illustrative; `details` identifies the A2A-specific failure. This body is neither a JSON-RPC `error` envelope nor a Task in `FAILED`: version selection failed before a Task exchange. For the JSON-RPC binding the corresponding native code is `-32009` inside an HTTP 200 JSON-RPC error response.
+
+### Compare one legacy exchange with its 1.0 equivalent
+
+A header change alone cannot migrate serialized data. Below are complete illustrative JSON-RPC bodies for the same calculation, sent to **separately selected** endpoints. Each request uses that endpoint's version/authentication configuration; readable IDs stand in for generated IDs. These are alternative runs, not two turns of one conversation.
+
+**v0.3 request** — legacy JSON-RPC method and discriminated Part/Message shapes:
+
+```json
+{"jsonrpc":"2.0","id":"legacy-math-1","method":"message/send","params":{"message":{"kind":"message","messageId":"msg-math-001","role":"user","parts":[{"kind":"text","text":"What is 2 + 2?"}]}}}
+```
+
+**v0.3 direct reply** — the Message itself is `result`:
+
+```json
+{"jsonrpc":"2.0","id":"legacy-math-1","result":{"kind":"message","messageId":"msg-math-002","contextId":"ctx-math-001","role":"agent","parts":[{"kind":"text","text":"2 + 2 = 4"}]}}
+```
+
+**v1.0 request** — PascalCase operation, enum role and unified Part:
+
+```json
+{"jsonrpc":"2.0","id":"v1-math-1","method":"SendMessage","params":{"message":{"messageId":"msg-math-001","role":"ROLE_USER","parts":[{"text":"What is 2 + 2?"}]}}}
+```
+
+**v1.0 direct reply** — `result` is now a SendMessageResponse containing `message`:
+
+```json
+{"jsonrpc":"2.0","id":"v1-math-1","result":{"message":{"messageId":"msg-math-002","contextId":"ctx-math-001","role":"ROLE_AGENT","parts":[{"text":"2 + 2 = 4"}]}}}
+```
+
+Follow the four changes: `message/send` → `SendMessage`, `user`/`agent` → enum names, removal of `kind`, and addition of `result.message`. Task-producing replies likewise need version-specific decoding; 1.0 streaming uses typed `StreamResponse` variants instead of the old discriminators/final flag. The Message ID and text keep their purpose while their surrounding schema changes. The [v0.3 schema](https://github.com/a2aproject/A2A/blob/v0.3.0/specification/json/a2a.json) and [v1.0.1 protobuf contract](https://github.com/a2aproject/A2A/blob/v1.0.1/specification/a2a.proto) define these shapes (checked 2026-11-16). Use the [cross-binding comparison](02_transport_and_rpc.md#the-same-message-over-httpjson-and-grpc) when the migration also changes transport.
 
 ## A dual-stack selection trace
 

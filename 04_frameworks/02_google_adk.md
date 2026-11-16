@@ -114,6 +114,48 @@ The auto-generated v1.0 card includes `supportedInterfaces`, `capabilities`, `sk
 
 This file is complete at the Python name/import level. Serving it still requires a compatible ADK installation and Gemini credentials; the model's answer wording is nondeterministic. Fetch the card first, then send a prime question and inspect the Task state and result against your installed ADK version. The local [adapter contract fixture](../examples/frameworks/adapter_contract.py) checks only the deterministic event-to-Task boundary, not `to_a2a()` or model behavior.
 
+### What the prime question looks like on the wire
+
+After fetching the card, POST this complete JSON-RPC body to its advertised JSONRPC URL, with `Content-Type: application/json` and `A2A-Version: 1.0`. Use the URL from `supportedInterfaces`, rather than assuming that the card URL itself accepts messages.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "rpc-prime-1",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "messageId": "msg-prime-1",
+      "role": "ROLE_USER",
+      "parts": [{"text": "Is 7919 prime?"}]
+    },
+    "configuration": {"returnImmediately": false}
+  }
+}
+```
+
+A representative successful reply is below. IDs and answer wording are illustrative; optional history, timestamps and adapter metadata are omitted. This shows the expected Task/artifact branch to inspect, rather than a captured Gemini run or a guarantee that every ADK adapter returns identical artifacts.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "rpc-prime-1",
+  "result": {
+    "task": {
+      "id": "task-prime-1",
+      "contextId": "ctx-prime-1",
+      "status": {"state": "TASK_STATE_COMPLETED"},
+      "artifacts": [{
+        "artifactId": "art-prime-1",
+        "parts": [{"text": "7919 is prime."}]
+      }]
+    }
+  }
+}
+```
+
+`rpc-prime-1` correlates the HTTP operation; `msg-prime-1` identifies the input Message. Neither is the server's `task-prime-1`. The answer text is in `result.task.artifacts[].parts`, while the state says whether processing finished. A direct Message result uses `result.message` instead; see the [canonical response branches](../02_protocol/02_transport_and_rpc.md#direct-reply-one-artifact-or-multiple-artifacts). Section 6 shows the conversion inside the adapter.
+
 ⚠️ The `port` argument to `to_a2a()` only sets the endpoint URL advertised in the generated card's first `supportedInterfaces` entry. It does *not* bind a socket — uvicorn does that. If `to_a2a(..., port=8001)` disagrees with `uvicorn --port 9000`, the card advertises a URL clients cannot reach.
 
 > **Rule**: Keep the `port` passed to `to_a2a()` identical to the port uvicorn binds, and make the advertised `supportedInterfaces[*].url` reachable from where clients actually run (not `localhost` if they are remote).
@@ -335,17 +377,71 @@ The root agent never knows `prime_agent` lives on another process. ✅ This is t
 
 This is the part that makes the abstraction leak-proof — and the part to understand before debugging.
 
-**Server side (`to_a2a` / `A2aAgentExecutor`)** consumes the `Runner.run_async()` event stream and converts:
+**Server side (`to_a2a` / `A2aAgentExecutor`)** consumes the `Runner.run_async()` event stream. This table gives mapping outcomes to verify for your converter/version and input; it is not a promise that every native Event triggers the corresponding transition:
 
 | ADK `Event` | A2A projection |
 |-------------|----------------|
 | Partial text event | `Message`/artifact chunks streamed via `SendStreamingMessage` |
-| `function_call` / `function_response` | Internal to the Task; not separate A2A messages |
+| `function_call` / `function_response` | Adapter-dependent: may be encoded as Parts/metadata; not new A2A Tasks |
 | Final response event | `Task` transitions to `TASK_STATE_COMPLETED`, text in artifact/message |
 | Error event | `Task` transitions to `TASK_STATE_FAILED` with an error |
-| Long-running tool pending | `Task` transitions to `TASK_STATE_INPUT_REQUIRED` |
+| Long-running tool pending | `TASK_STATE_INPUT_REQUIRED` only when the adapter recognizes a supported pending-input representation; a pending tool return alone does not prove a pause |
 
 **Client side (`RemoteA2aAgent`)** does the inverse: incoming A2A `Message` / `Task` / `TaskStatusUpdateEvent` / `TaskArtifactUpdateEvent` are converted back into ADK `Event`s and yielded into the parent agent's stream (this is what the `*_converter` config hooks override).
+
+### Follow one native Event through both converters
+
+For a concrete, reproducible mapping, this subsection uses **`google-adk==2.6.2` with `a2a-sdk==1.1.2`**, inspected and exercised without a model on 2026-11-16. The [release's dependency declaration](https://github.com/google/adk-python/blob/v2.6.2/pyproject.toml) permits that SDK version. This pins the conversion example, rather than changing the collection's A2A 1.0 baseline.
+
+The following JSON is an **ADK Event excerpt**, using ADK's JSON aliases. It is the final text event after the remote agent has used `check_prime`; timestamps, default fields and other execution events are omitted.
+
+```json
+{
+  "id": "adk-event-prime-1",
+  "invocationId": "inv-remote-prime-1",
+  "author": "check_prime_agent",
+  "partial": false,
+  "content": {"role": "model", "parts": [{"text": "7919 is prime."}]}
+}
+```
+
+The new server converter, [`from_adk_event.convert_event_to_a2a_events`](https://github.com/google/adk-python/blob/v2.6.2/src/google/adk/a2a/converters/from_adk_event.py), turns its text into this **TaskArtifactUpdateEvent**. Shown inside `StreamResponse.artifactUpdate`, with the SSE/JSON-RPC envelope omitted and generated Artifact ID normalized:
+
+```json
+{
+  "artifactUpdate": {
+    "taskId": "task-prime-1",
+    "contextId": "ctx-prime-1",
+    "artifact": {
+      "artifactId": "art-prime-1",
+      "parts": [{"text": "7919 is prime."}],
+      "metadata": {
+        "adk_invocation_id": "inv-remote-prime-1",
+        "adk_event_id": "adk-event-prime-1",
+        "adk_author": "check_prime_agent",
+        "adk_actions": {"stateDelta": {}}
+      }
+    },
+    "lastChunk": true
+  }
+}
+```
+
+`partial: false` produces `lastChunk: true`; omitted protobuf `append` means false for this first artifact. `adk_*` metadata belongs to this adapter, not the A2A core schema. This event supplies output; the executor separately emits `TASK_STATE_COMPLETED`. For the complete request and SSE framing, use [the streaming transcript](../02_protocol/00_client_server_walkthrough.md#3-change-delivery-one-request-an-open-response-several-updates).
+
+The receiving [`to_adk_event.convert_a2a_artifact_update_to_event`](https://github.com/google/adk-python/blob/v2.6.2/src/google/adk/a2a/converters/to_adk_event.py), called with the local remote-agent name `prime_agent`, produces this **parent-side ADK Event excerpt**:
+
+```json
+{
+  "author": "prime_agent",
+  "partial": false,
+  "content": {"role": "model", "parts": [{"text": "7919 is prime."}]}
+}
+```
+
+The content survives; `lastChunk` becomes the inverse `partial` flag. The parent uses its own invocation context and generated Event identity, omitted above: the original `adk_event_id` is not the new Event's ID. With no invocation context, a direct converter call generates an invocation ID. This is a projection, not a byte-for-byte round trip.
+
+**Adapter policy matters:** these are the new converter functions, not the legacy `event_converter.py` functions. In ADK 2.6.2, [`A2aAgentExecutor`](https://github.com/google/adk-python/blob/v2.6.2/src/google/adk/a2a/executor/a2a_agent_executor.py) selects the new path when its ADK extension is requested or `force_new_version=True` is configured; `use_legacy=True` forces the older path. A normal unextended request from section 2 must not be assumed to use this conversion. In a native ADK-to-ADK run, verify the selected extension/converters and inspect their actual output before relying on metadata, tool-call or pause behavior. Recheck both directions when changing ADK versions.
 
 ### Long-running tools and `input-required`
 

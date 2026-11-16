@@ -249,16 +249,55 @@ class SemanticKernelExecutor(AgentExecutor):
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         thread = ChatHistoryAgentThread()      # SK conversational memory
-        # SK is async-native: invoke_stream yields StreamingChatMessageContent.
+        # invoke_stream yields AgentResponseItem wrappers around native chunks.
         async for response in self._agent.invoke_stream(
             messages=context.get_user_input(), thread=thread
         ):
-            # map each SK streaming chunk → an A2A TaskStatusUpdateEvent
-            await event_queue.enqueue_event(_status_update(context, str(response)))
+            # Forward selected public text, not the raw SK object/tool-call fields.
+            chunk = response.message  # StreamingChatMessageContent
+            if chunk.content:
+                await event_queue.enqueue_event(_status_update(context, chunk.content))
         # ... emit a final artifact and TASK_STATE_COMPLETED status (omitted)
 ```
 
 ✅ SK is **async-native** (`invoke`, `invoke_stream` are coroutines), so it drops cleanly into `AgentExecutor.execute` with no thread-pool wrapping.
+
+For example, the native chunk in `response.message` can look like this constructor excerpt; provider-specific fields are omitted. [`ChatCompletionAgent.invoke_stream`](https://github.com/microsoft/semantic-kernel/blob/main/python/semantic_kernel/agents/chat_completion/chat_completion_agent.py) yields an `AgentResponseItem` wrapper; its `.message` is the [`StreamingChatMessageContent`](https://github.com/microsoft/semantic-kernel/blob/main/python/semantic_kernel/contents/streaming_chat_message_content.py) whose `content` is text and whose `choice_index` identifies the choice (source checked 2026-11-16):
+
+```python
+from semantic_kernel.contents import StreamingChatMessageContent
+from semantic_kernel.contents.utils.author_role import AuthorRole
+
+chunk = StreamingChatMessageContent(
+    role=AuthorRole.ASSISTANT,
+    choice_index=0,
+    content="Paris fits your budget.",
+)
+progress_text = chunk.content  # "Paris fits your budget."
+```
+
+If this adapter chooses to expose that text as progress, `_status_update` must create a standard A2A status Message, for example this **StreamResponse excerpt**, with the JSON-RPC/SSE envelope and timestamp omitted:
+
+```json
+{
+  "statusUpdate": {
+    "taskId": "task-travel-1",
+    "contextId": "ctx-travel-1",
+    "status": {
+      "state": "TASK_STATE_WORKING",
+      "message": {
+        "messageId": "msg-travel-progress-1",
+        "role": "ROLE_AGENT",
+        "taskId": "task-travel-1",
+        "contextId": "ctx-travel-1",
+        "parts": [{"text": "Paris fits your budget."}]
+      }
+    }
+  }
+}
+```
+
+The text is now `status.message.parts[0].text`; the SK object itself never crosses the A2A boundary. This is the explicit adapter's policy, not a native SK wire format. Accumulate the selected answer chunks separately and emit a final Artifact plus `COMPLETED`, using [TaskUpdater](../03_python/02_building_a_server.md#taskupdater--the-ergonomic-alternative); the concrete output pair is shown in the LlamaIndex branch below. For answer tokens intended to grow an Artifact as they arrive, use the [incremental Artifact transcript](../02_protocol/00_client_server_walkthrough.md#3-change-delivery-one-request-an-open-response-several-updates) instead of treating every token as progress.
 
 For consuming a remote A2A agent from SK, the sample/devblog approach builds a `KernelFunction` from the remote Agent Card and bundles it as a plugin — there is no shipped helper class; you write the factory yourself.
 
@@ -287,8 +326,9 @@ class LlamaIndexWorkflowExecutor(AgentExecutor):
 
         # (2)+(3) stream Workflow events → A2A status updates
         async for event in handler.stream_events():
-            # the sample emits a LogEvent per step; map it to a TaskStatusUpdateEvent
-            await event_queue.enqueue_event(_status_update(context, str(event)))
+            # LogEvent is the application's public progress type, defined below.
+            if isinstance(event, LogEvent):
+                await event_queue.enqueue_event(_status_update(context, event.msg))
 
         result = await handler                # final Workflow result
         await event_queue.enqueue_event(_completed(context, result))
@@ -297,6 +337,63 @@ class LlamaIndexWorkflowExecutor(AgentExecutor):
 LlamaIndex `Workflow` event streaming maps almost 1:1 onto A2A's incremental `Task` events — each `LogEvent`/custom event becomes a `TaskStatusUpdateEvent`, and the final result becomes an artifact. To consume a remote A2A agent inside LlamaIndex, wrap the `a2a-sdk` client call in a `FunctionTool` and hand it to an `AgentWorkflow` / `FunctionAgent`.
 
 For both this branch and the Semantic Kernel excerpt, the omitted `_status_update`/`_completed` functions are real adapter work, not built-in functions. Use `TaskUpdater` from the prerequisite and test a working update followed by exactly one artifact and a final state. The local [adapter contract fixture](../examples/frameworks/adapter_contract.py) exercises that expected state sequence without loading either framework; it does not establish their API compatibility.
+
+A Workflow's native event need not be answer text. For instance, an application can define this `LogEvent`, following the [Workflow streaming pattern](https://developers.llamaindex.ai/python/llamaagents/workflows/streaming/):
+
+```python
+from llama_index.core.workflow import Event
+
+class LogEvent(Event):
+    msg: str
+
+event = LogEvent(msg="Parsed itinerary.pdf")
+progress_text = event.msg
+final_text = "The itinerary contains three days in Paris."  # example Workflow result
+```
+
+The adapter deliberately selects `event.msg` for public progress instead of exposing a Python representation of the event. For `task-travel-1` / `ctx-travel-1`, the mapping can use these concrete SDK calls **inside an executor after its initial Task has been enqueued**:
+
+```python
+from a2a.server.tasks import TaskUpdater
+from a2a.types import Part, TaskState
+
+updater = TaskUpdater(event_queue, context.task_id, context.context_id)
+await updater.update_status(
+    TaskState.TASK_STATE_WORKING,
+    updater.new_agent_message([Part(text=progress_text)]),
+)
+await updater.add_artifact(
+    [Part(text=final_text)], artifact_id="art-itinerary-1", name="itinerary",
+)
+await updater.complete()
+```
+
+The first update has the same shape as the SK status example, with `Parsed itinerary.pdf` in `status.message.parts`. The next two **StreamResponse objects**, shown as an ordered JSON array for explanation, carry the result and completion. On SSE they are separate frames, not one array; timestamps and default-false `append`/`lastChunk` fields are omitted.
+
+```json
+[
+  {
+    "artifactUpdate": {
+      "taskId": "task-travel-1",
+      "contextId": "ctx-travel-1",
+      "artifact": {
+        "artifactId": "art-itinerary-1",
+        "name": "itinerary",
+        "parts": [{"text": "The itinerary contains three days in Paris."}]
+      }
+    }
+  },
+  {
+    "statusUpdate": {
+      "taskId": "task-travel-1",
+      "contextId": "ctx-travel-1",
+      "status": {"state": "TASK_STATE_COMPLETED"}
+    }
+  }
+]
+```
+
+The client can display the parsing progress, then retain the Artifact as the answer and stop waiting when the Task completes. `LogEvent.msg` never becomes a new A2A field. The same TaskUpdater sequence can publish SK's accumulated final answer; only the framework-side extraction changes. See the [canonical complete Task executor](../03_python/02_building_a_server.md#a-complete-task-based-executor) for initialization, validation and error handling omitted from this mapping excerpt.
 
 ⚠️ Workflows are async-native, but `Workflow.run()` returns a *handler* — you must `await` it (or stream it) inside `execute`; forgetting to await silently drops the result.
 
@@ -363,6 +460,8 @@ asyncio.run(main())
 ```
 
 AG2 demonstrates the agent-as-a-service pattern: the remote agent's tools, environment, and model remain encapsulated behind the A2A endpoint.
+
+An illustrative printed answer is `The function adds a and b; add type hints if you want a typed interface.` Its wording depends on the configured model. `reply.response.content` is AG2's client-facing object; it does not show whether the peer returned an A2A Message or a Task with Artifacts. Inspect the advertised binding and compare a captured exchange with the [complete request/response](../02_protocol/02_transport_and_rpc.md#3-a-complete-json-rpc-requestresponse-pair) and [both response branches](../02_protocol/02_transport_and_rpc.md#direct-reply-one-artifact-or-multiple-artifacts) before assuming a wire shape from that printed string.
 
 ---
 

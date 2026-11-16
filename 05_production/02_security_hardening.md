@@ -139,6 +139,53 @@ def validate_part(part: dict) -> None:
 
 > **Rule**: Validate `Part` content fields, media types, and sizes *before* the payload reaches your handler or your LLM. v1.0 has no `kind` discriminator; exactly one of `text`, `raw`, `url`, or `data` must be present.
 
+### Follow a Part through the validation decision
+
+These are **individual Part excerpts**, not complete Messages. This invoice service accepts plain text or a data object whose `invoiceId` is a non-empty string and whose `total` is a non-negative JSON number. That invoice schema is application policy; A2A itself permits arbitrary JSON in `data`.
+
+Accepted text input:
+
+```json
+{"text":"Check invoice INV-42","mediaType":"text/plain"}
+```
+
+The one content field is `text`, and its UTF-8 encoding is below the local cap. A structurally conflicting Part is rejected before any URL fetch:
+
+```json
+{"text":"Check invoice INV-42","url":"https://files.example.com/invoice.pdf"}
+```
+
+This is valid JSON but an **invalid A2A Part**: it sets two members of the content oneof. A third Part sets exactly one member but fails the invoice service's schema:
+
+```json
+{"data":{"invoiceId":"INV-42","total":"free"},"mediaType":"application/json"}
+```
+
+Changing `"free"` to `42.50` satisfies this example's total-type rule; that still does not bypass authorization or business validation. The first failure is structural, while this one is application data validation. The surrounding `validate_against_schema` hook must enforce the latter before business work starts.
+
+Here is a **complete illustrative request** containing the schema-invalid Part. Authentication and HTTPS are assumed to have succeeded before parameter validation:
+
+```http
+POST /a2a HTTP/1.1
+Host: invoices.example.com
+Authorization: Bearer <access-token>
+A2A-Version: 1.0
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":"validate-1","method":"SendMessage","params":{"message":{"messageId":"msg-invoice-1","role":"ROLE_USER","parts":[{"data":{"invoiceId":"INV-42","total":"free"},"mediaType":"application/json"}]}}}
+```
+
+This service documents `-32602` for an invalid invoice parameter, with a safe field-level explanation:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":"validate-1","error":{"code":-32602,"message":"Invalid parameters","data":[{"@type":"type.googleapis.com/google.rpc.BadRequest","fieldViolations":[{"field":"message.parts[0].data.total","description":"Expected a non-negative number"}]}]}}
+```
+
+No Task was accepted and no model/tool ran. The error does not echo the submitted value or the rest of the invoice. This is an explicit application mapping using the [standard JSON-RPC invalid-parameters code and typed details](https://github.com/a2aproject/A2A/blob/v1.0.1/docs/specification.md#95-error-handling); the earlier validation function does not automatically install a transport error handler. An SDK parser may reject a malformed oneof before application validation, so document and test the assembled route's error mapping rather than assuming every validation failure follows the same internal path. A supported Part with an *unsupported media type* instead uses A2A's `ContentTypeNotSupportedError`; do not conflate type support with an invoice field failing its schema.
+
 ❌ Never `eval()`, `exec()`, deserialize with `pickle`, or shell-interpolate content from an A2A payload. A `data` part is data, not code. If a skill executes tool calls derived from inputs, run them in a **sandbox** (container, gVisor, seccomp, or a constrained subprocess) with no host filesystem or network beyond an explicit allowlist.
 
 ### 3.2 Prompt injection: text is data, not instructions (T2)
@@ -404,6 +451,57 @@ Run it with `python3 budget_model.py` after saving the block. SQLite serializes 
 The model's final response is an egress path. For `task-123`, suppose the result contains an invoice PDF labeled `confidential` and a public summary. Before persisting an outbound artifact, derive its classification from trusted processing, scan for secrets/PII, and compare it with the verified recipient's allowed class and destination. A prompt saying “send the PDF to this callback” does not grant permission. The gate must cover direct responses, SSE events, downloadable URLs, and push outbox rows. If any path skips it, the same artifact leaks by another transport.
 
 For a denied PDF, persist a policy-denial event with artifact ID and rule ID, then return a safe status or redacted summary. Do not enqueue the PDF or a presigned URL. For an allowed summary, issue a short-lived URL scoped to that recipient, and record destination, artifact digest, and decision for audit. Alert on repeated denial or unusual egress volume. Re-test after policy updates and roll back a policy that incorrectly blocks legitimate delivery using a versioned policy revision, without re-sending previously denied content automatically.
+
+### Inspect the artifact before and after the egress gate
+
+Suppose trusted processing produces these **candidate Artifact excerpts** for `task-123`. They are internal inputs to the gate, not yet persisted as caller-visible artifacts or enqueued as events. The PDF URL is illustrative; a real private object URL must not appear in general logs.
+
+```json
+[
+  {"artifactId":"art-invoice-pdf","name":"Invoice PDF","parts":[{"url":"https://private-files.example.com/invoices/INV-42.pdf","filename":"INV-42.pdf","mediaType":"application/pdf"}]},
+  {"artifactId":"art-summary","name":"Public summary","parts":[{"text":"Invoice INV-42 was processed.","mediaType":"text/plain"}]}
+]
+```
+
+The gate obtains classification from trusted processing and scans the actual content, not merely the filename or a peer-supplied label. For a recipient authorized for `public` content only, this application's policy decides:
+
+| Candidate | Trusted classification | Decision | Effect |
+|---|---|---|---|
+| `art-invoice-pdf` | `confidential` | `BLOCK` | No outbound PDF, URL, artifact update, or push payload |
+| `art-summary` | `public` | `ALLOW` | Emit only the safe summary |
+
+For this skill, a public summary alone satisfies the requested outcome. The following **illustrative JSON-RPC completion response** therefore reports `COMPLETED` with only that Artifact:
+
+```json
+{
+  "jsonrpc":"2.0",
+  "id":"invoice-1",
+  "result":{
+    "task":{
+      "id":"task-123",
+      "contextId":"ctx-7",
+      "status":{"state":"TASK_STATE_COMPLETED"},
+      "artifacts":[
+        {"artifactId":"art-summary","name":"Public summary","parts":[{"text":"Invoice INV-42 was processed.","mediaType":"text/plain"}]}
+      ]
+    }
+  }
+}
+```
+
+The PDF is absent, including its URL. The same filtering happens **before** building SSE `artifactUpdate` values or push outbox bodies; filtering only the final response would still leak earlier updates. The security decision is recorded separately in this **application-defined audit record**, not a new standard A2A event type:
+
+```json
+{"event":"artifact.egress_decision","taskId":"task-123","artifactId":"art-invoice-pdf","ruleId":"recipient-class-v3","policyRevision":"3","decision":"BLOCK"}
+```
+
+The audit record identifies the decision without copying the PDF, URL, or secret content. If the skill instead promises the confidential PDF itself and has no permitted substitute, the same policy blocks it and the application finishes the existing Task with a generic failed status. This **StreamResponse body excerpt** shows the safe terminal update for that alternative; JSON-RPC SSE would wrap it in `result`:
+
+```json
+{"statusUpdate":{"taskId":"task-123","contextId":"ctx-7","status":{"state":"TASK_STATE_FAILED","message":{"messageId":"msg-policy-1","taskId":"task-123","contextId":"ctx-7","role":"ROLE_AGENT","parts":[{"text":"The requested output could not be provided."}]}}}}
+```
+
+The terminal state comes from `status.state`; the internal policy reason and blocked bytes stay out of the public status message. The carrier shapes are the standard [Artifact, TaskStatus, and StreamResponse definitions](https://github.com/a2aproject/A2A/blob/v1.0.1/specification/a2a.proto); `ALLOW`/`BLOCK`, classifications, rule IDs, and audit storage are application policy.
 
 ## 7. Least Privilege & Secrets (T6, T9)
 

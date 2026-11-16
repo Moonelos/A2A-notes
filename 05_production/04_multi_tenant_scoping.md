@@ -122,6 +122,80 @@ uv pip install --python /tmp/a2a-route-venv/bin/python 'a2a-sdk[http-server]==1.
 
 The asserted result is `TASK_NOT_FOUND` for `GetTask`, `CancelTask`, `GetTaskPushNotificationConfig`, and active `SubscribeToTask`; an Acme `X-Tenant: tenant-B` hint receives HTTP 403; Beta sees `WORKING` then `COMPLETED`. The fixture verifies context propagation and SDK owner checks on this JSON-RPC path. It uses an in-memory store and does not exercise JWT verification, SQL isolation, gRPC/REST bindings, a real push callback, or cluster-mode event replay. Run those boundaries with your deployed stores and gateway before release.
 
+### Compare the same Task ID under two principals
+
+These are **illustrative wire transcripts** of that route's policy, with generated Task/context IDs normalized to `task-7`/`ctx-7`. They are not captured fixture output; optional history and timestamps are omitted. The local token strings below are deliberately the fixture's test identities, not production credentials. In production, the same comparison uses independently verified tokens. This route uses an application `X-Tenant` selection header; that header is not a standard A2A authorization field.
+
+Beta owns the working Task and sends:
+
+```http
+POST /a2a HTTP/1.1
+Host: testserver
+Authorization: Bearer b-local-token
+X-Tenant: tenant-B
+A2A-Version: 1.0
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":"get-beta-1","method":"GetTask","params":{"id":"task-7"}}
+```
+
+The handler returns the Task directly in `result` (`GetTask` does not use the `SendMessage` response's `result.task` wrapper):
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":"get-beta-1","result":{"id":"task-7","contextId":"ctx-7","status":{"state":"TASK_STATE_WORKING"}}}
+```
+
+Acme sends the same Task ID under its own verified principal:
+
+```http
+POST /a2a HTTP/1.1
+Host: testserver
+Authorization: Bearer a-local-token
+X-Tenant: tenant-A
+A2A-Version: 1.0
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":"get-acme-1","method":"GetTask","params":{"id":"task-7"}}
+```
+
+Its owner-scoped lookup finds no accessible row. The JSON-RPC request reaches the handler, which returns an error envelope rather than Beta's Task:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":"get-acme-1","error":{"code":-32001,"message":"Task not found"}}
+```
+
+An actually absent Task ID produces the same error code and message for Acme. The error contains no owner name, state, history, or artifact that would confirm Beta's Task exists. Optional typed error details are omitted here; see the [JSON-RPC error mapping](../02_protocol/02_transport_and_rpc.md#5-error-codes) and the [pinned specification](https://github.com/a2aproject/A2A/blob/v1.0.1/docs/specification.md#54-error-code-mappings).
+
+Now Acme changes only the requested tenant to `tenant-B`:
+
+```http
+POST /a2a HTTP/1.1
+Host: testserver
+Authorization: Bearer a-local-token
+X-Tenant: tenant-B
+A2A-Version: 1.0
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":"get-acme-2","method":"GetTask","params":{"id":"task-7"}}
+```
+
+The fixture's ingress middleware rejects that selection before the SDK lookup:
+
+```http
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{"error":"tenant forbidden"}
+```
+
+This last body is the fixture application's HTTP error format, not a JSON-RPC error object. A client must inspect HTTP status before expecting a JSON-RPC `result` or `error`. Merely knowing Beta's tenant string changes neither Acme's verified membership nor the owner predicate.
+
 ## Retain the model
 
 - Token validation establishes the subject and operation scopes; membership chooses the permitted tenant.

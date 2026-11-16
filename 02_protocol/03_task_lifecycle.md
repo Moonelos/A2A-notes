@@ -310,11 +310,101 @@ The client's job:
 
 ⚠️ Never put downstream credentials in a message `part`. Complete the negotiated external OAuth, secret-broker, or other authorization flow. The ordinary A2A `Authorization` header authenticates the caller to the agent; it is not a carrier for a downstream provider token. The `auth-required` state does not invite a token in chat text.
 
+### What the authorization pause actually looks like
+
+In this separate report run, the agent must read a CRM on the user's behalf. The following are complete illustrative JSON-RPC bodies sent to the advertised endpoint with `A2A-Version: 1.0` and the caller's normal A2A authentication. The application already has a trusted account-settings portal for CRM authorization.
+
+**Client request:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "rpc-auth-report-1",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "messageId": "msg-auth-report-1",
+      "role": "ROLE_USER",
+      "parts": [{"text": "Generate the October sales report from my CRM"}]
+    }
+  }
+}
+```
+
+**Agent response — work exists, but the CRM grant is missing:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "rpc-auth-report-1",
+  "result": {
+    "task": {
+      "id": "task-auth-report-1",
+      "contextId": "ctx-auth-report-1",
+      "status": {
+        "state": "TASK_STATE_AUTH_REQUIRED",
+        "message": {
+          "messageId": "msg-crm-auth-1",
+          "role": "ROLE_AGENT",
+          "taskId": "task-auth-report-1",
+          "contextId": "ctx-auth-report-1",
+          "parts": [{"text": "Authorize CRM read access through your account's connected-app settings. I will continue this report when the grant is available."}]
+        }
+      }
+    }
+  }
+}
+```
+
+Display the explanation in `result.task.status.message`; keep the Task ID for observation. There is no credential, OAuth endpoint or standardized `authorizationUrl` field in this body. The account portal and its grant-to-Task association are this application's external authorization mechanism. The client must use its trusted configuration rather than treating an arbitrary URL in generated text as a trusted login destination.
+
+Follow the boundary between the ordinary A2A exchange and the external grant in this trace:
+
+```mermaid
+sequenceDiagram
+  participant C as Report client
+  participant A as Report agent
+  participant G as Trusted CRM grant service
+  C->>A: SendMessage for October CRM report
+  A-->>C: task-auth-report-1, AUTH_REQUIRED, explanatory Message
+  C->>G: User authorizes CRM read access outside A2A
+  G-->>A: Grant available through negotiated secure channel
+  A->>A: Resume same Task and persist report
+  C->>A: GetTask id=task-auth-report-1
+  A-->>C: Same Task COMPLETED with report Artifact
+```
+
+The grant service informs the agent, so the client need not send a chat message saying "authorized" to resume it. That sentence would not establish authorization. In this example the client observes completion through a later read:
+
+```json
+{"jsonrpc":"2.0","id":"rpc-auth-read-1","method":"GetTask","params":{"id":"task-auth-report-1"}}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "rpc-auth-read-1",
+  "result": {
+    "id": "task-auth-report-1",
+    "contextId": "ctx-auth-report-1",
+    "status": {"state": "TASK_STATE_COMPLETED"},
+    "artifacts": [{
+      "artifactId": "art-crm-report-1",
+      "parts": [{"text": "October sales: $150,000."}]
+    }]
+  }
+}
+```
+
+Here `GetTask` returns the Task directly under `result`; the earlier `SendMessage` used `result.task`. A read while the grant was still pending would show AUTH_REQUIRED again; it would not fulfill the grant. The [A2A 1.0 in-task authorization rules](https://a2a-protocol.org/v1.0.0/specification/#76-in-task-authorization) define the pause and out-of-band boundary (checked 2026-11-16); this portal workflow is an application example of those rules.
+
 ---
 
 ## 7. Polling, cancelling, and linking tasks
 
 For non-streaming clients, the lifecycle is observed by **polling**:
+
+The [worked GetTask, CancelTask and paginated ListTasks exchanges](02_transport_and_rpc.md#read-cancel-and-list-existing-tasks) show the exact bodies, result shapes and cancellation-race readback. Use those operation-specific envelopes rather than copying `SendMessage`'s `result.task` wrapper.
 
 - **`GetTask`** — fetch the current `Task` (and thus its `status.state`). Poll on a backoff until `state` is terminal, then stop. `GetTask` is a pure read and fully **idempotent** — calling it ten times changes nothing.
 - **`CancelTask`** — request that the agent stop a non-terminal Task. On success the Task moves to `TASK_STATE_CANCELED`. Calling it for a completed, failed, canceled, or rejected Task returns `TaskNotCancelableError`; it cannot resurrect or alter finished work.

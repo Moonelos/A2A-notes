@@ -117,7 +117,28 @@ curl -s http://127.0.0.1:9999/ \
 
 The first client Message supplies `messageId` but no Task/context IDs. In this baseline, `new_task_from_user_message(context.message)` allocates the Task ID and a context when absent; `TaskUpdater` emits its state and output events. On an existing-Task continuation, the handler resolves `context.current_task`, so the executor reuses that object. The server handler must reject unknown Task references before execution: a low-level helper accepting an ID is not permission for a client to create remote work under an invented Task ID. The executor chooses Task output here; a direct Message response is also possible in A2A. See the [identity walkthrough](../01_fundamentals/02_core_concepts.md#who-creates-each-id).
 
-Success is a response whose `result.task.status.state` is `TASK_STATE_COMPLETED` and whose Artifact text is `echo: hello`. A `404` means `rpc_url` and the advertised interface path disagree; an import failure naming Starlette means the `http-server` extra is missing.
+The response looks like this. IDs and timestamps are illustrative; this excerpt omits optional Task history and generated status timestamps, while retaining the complete JSON-RPC envelope and the output:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "demo-1",
+  "result": {
+    "task": {
+      "id": "task-echo-1",
+      "contextId": "ctx-echo-1",
+      "status": {"state": "TASK_STATE_COMPLETED"},
+      "artifacts": [{
+        "artifactId": "art-echo-1",
+        "name": "echo",
+        "parts": [{"text": "echo: hello"}]
+      }]
+    }
+  }
+}
+```
+
+The echoed RPC `id` correlates the HTTP call; `result.task.id` identifies the work for later reads. Display the text in `result.task.artifacts[0].parts[0]` for this one-Artifact example. The request Message did not contain that Artifact: the executor created it. A `404` means `rpc_url` and the advertised interface path disagree; an import failure naming Starlette means the `http-server` extra is missing.
 
 > **Production:** this baseline uses process-local task state and no authentication. The rest of this note explains the pieces; [Authentication](../05_production/01_authentication.md), [Security Hardening](../05_production/02_security_hardening.md), and [Scaling & Deployment](../05_production/03_scaling_deployment.md) own the production boundary.
 
@@ -641,30 +662,62 @@ SendMessage:          (buffered — client gets the final Task once COMPLETED)
 
 Every `enqueue_event` call becomes one SSE frame for a streaming client. The implications:
 
-- **Granularity is yours.** Want a progress bar? Emit several `TaskStatusUpdateEvent`s with `WORKING` and descriptive messages. Want token-by-token output? Emit many `TaskArtifactUpdateEvent`s with `append=True` and `last_chunk=True` on the final one.
+- **Granularity is yours.** Want a progress bar? Emit several `TaskStatusUpdateEvent`s with `WORKING` and descriptive messages. For generated text, start one Artifact with `append=False`, append later chunks to that same ID, and set `last_chunk=True` on its final update.
 - **`AgentCapabilities(streaming=True)`** must be set in the Agent Card or clients will not attempt `SendStreamingMessage`.
 - **The first event is what unblocks the client.** For a non-streaming `SendMessage` with `return_immediately=True`, the SDK waits only until the first `Task` or `Message` is enqueued.
 
+This executor excerpt assumes `task` has already been published and moved to WORKING, and that `self._llm.stream(prompt)` yields text strings. Allocate the output ID once, before iterating:
+
 ```python
-# Streaming progress: emit chunks as they are produced.
+from uuid import uuid4
+
+from a2a.helpers import new_text_artifact
+from a2a.types import TaskArtifactUpdateEvent, TaskState, TaskStatus, TaskStatusUpdateEvent
+
+artifact_id = str(uuid4())
+first_chunk = True
 async for chunk in self._llm.stream(prompt):
     await event_queue.enqueue_event(
         TaskArtifactUpdateEvent(
             task_id=task.id, context_id=task.context_id,
-            artifact=new_text_artifact(name='answer', text=chunk),
-            append=True,          # this chunk appends to the named artifact
+            artifact=new_text_artifact(
+                name='answer', text=chunk, artifact_id=artifact_id,
+            ),
+            append=not first_chunk, last_chunk=False,
         )
     )
+    first_chunk = False
+# An empty final Part closes this Artifact; it also creates it if the model yielded nothing.
 await event_queue.enqueue_event(
     TaskArtifactUpdateEvent(
         task_id=task.id, context_id=task.context_id,
-        artifact=new_text_artifact(name='answer', text=''),
-        append=True, last_chunk=True,      # signal end of the artifact stream
+        artifact=new_text_artifact(name='answer', text='', artifact_id=artifact_id),
+        append=not first_chunk, last_chunk=True,
+    )
+)
+await event_queue.enqueue_event(
+    TaskStatusUpdateEvent(
+        task_id=task.id, context_id=task.context_id,
+        status=TaskStatus(state=TaskState.TASK_STATE_COMPLETED),
     )
 )
 ```
 
-There is no separate executor streaming mode. The executor emits events; the transport either relays them as SSE or buffers them into one final response.
+For model chunks `Hello, ` and `world.`, the corresponding SSE frames look like the following excerpt. The initial Task/WORKING frames are omitted, and `art-answer-1` stands for the generated UUID:
+
+```text
+data: {"jsonrpc":"2.0","id":"rpc-answer-1","result":{"artifactUpdate":{"taskId":"task-answer-1","contextId":"ctx-answer-1","artifact":{"artifactId":"art-answer-1","name":"answer","parts":[{"text":"Hello, "}]},"append":false,"lastChunk":false}}}
+
+data: {"jsonrpc":"2.0","id":"rpc-answer-1","result":{"artifactUpdate":{"taskId":"task-answer-1","contextId":"ctx-answer-1","artifact":{"artifactId":"art-answer-1","name":"answer","parts":[{"text":"world."}]},"append":true,"lastChunk":false}}}
+
+data: {"jsonrpc":"2.0","id":"rpc-answer-1","result":{"artifactUpdate":{"taskId":"task-answer-1","contextId":"ctx-answer-1","artifact":{"artifactId":"art-answer-1","name":"answer","parts":[{"text":""}]},"append":true,"lastChunk":true}}}
+
+data: {"jsonrpc":"2.0","id":"rpc-answer-1","result":{"statusUpdate":{"taskId":"task-answer-1","contextId":"ctx-answer-1","status":{"state":"TASK_STATE_COMPLETED"}}}}
+```
+
+The client groups updates by `artifactId` and joins their text Parts in order: `Hello, world.`. The empty last Part adds no text. `lastChunk` closes this output; the final status update closes the Task. Explicit `false` values may be omitted by ProtoJSON serializers without changing this trace's meaning.
+
+The [SDK 1.1.2 Artifact helper](https://github.com/a2aproject/a2a-python/blob/v1.1.2/src/a2a/helpers/proto_helpers.py) generates a new UUID whenever `artifact_id` is omitted (checked 2026-11-16). Repeating `name='answer'` therefore cannot join chunks. There is no separate executor streaming mode: events go through the same handler, and the transport either relays them as SSE or buffers them into one final response. The [live report lab](../02_protocol/00_client_server_walkthrough.md#5-run-the-same-interaction-and-watch-it-arrive) demonstrates the complete HTTP producer/consumer path.
 
 ---
 

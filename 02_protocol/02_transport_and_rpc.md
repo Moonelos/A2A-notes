@@ -1,5 +1,7 @@
 # A2A Transport & RPC Methods
 
+<!-- length-justification: Keep complete send, task-management, pagination, and cross-binding exchanges together so readers can compare each operation's actual envelope and result type. -->
+
 > **Who this is for**: Engineers implementing the A2A (Agent2Agent) protocol directly — building a server, writing a client, or wanting to know exactly what an A2A SDK does on the wire. Targets protocol **1.0**, checked against specification release **1.0.1**.
 
 Before reading this, understand how an agent advertises itself: **[The Agent Card](01_agent_card.md)**.
@@ -59,7 +61,7 @@ An agent declares its transports in the **Agent Card** with an ordered `supporte
 
 > **Rule**: An agent that exposes multiple transports MUST provide **functional equivalence** across all of them — every operation must behave identically regardless of which binding the client picks. A client may choose any advertised transport it supports, though it should prefer earlier `supportedInterfaces` entries unless it has a reason not to.
 
-The rest of this note focuses on the **JSON-RPC 2.0 binding**, since it is the default and the one most SDKs implement first. The method *semantics* carry over to gRPC and REST unchanged.
+The next examples use the **JSON-RPC 2.0 binding**. After sending and managing work, we compare the same Message over HTTP+JSON and gRPC so the envelope differences are visible.
 
 ---
 
@@ -116,7 +118,7 @@ A `SendMessage` call carries a `SendMessageRequest` object. The `message` field 
 }
 ```
 
-**Response** — agent → client. The `result` is a `Task`:
+**Response** — agent → client. The `result` is a `SendMessageResponse` containing a `task`:
 
 ```json
 {
@@ -230,6 +232,145 @@ The [protocol response definitions](https://github.com/a2aproject/A2A/blob/v1.0.
 
 ---
 
+### Read, cancel and list existing Tasks
+
+The following are complete illustrative JSON-RPC bodies, posted to the selected JSON-RPC URL with `Content-Type: application/json`, `A2A-Version: 1.0` and the caller's authentication. IDs and cursor values are illustrative. Unlike `SendMessage`, **GetTask and CancelTask return the Task directly in `result`**, without `result.task`.
+
+**Read the completed report.** `historyLength: 0` requests no history Messages; it does not remove Artifacts:
+
+```json
+{"jsonrpc":"2.0","id":"read-1","method":"GetTask","params":{"id":"task-123","historyLength":0}}
+```
+
+```json
+{
+  "jsonrpc":"2.0", "id":"read-1",
+  "result":{
+    "id":"task-123", "contextId":"ctx-sales-001",
+    "status":{"state":"TASK_STATE_COMPLETED"},
+    "artifacts":[{"artifactId":"art-001","name":"summary","parts":[{"text":"October total sales: $150,000"}]}]
+  }
+}
+```
+
+Read `result.status.state`, then `result.artifacts`; this is the same stored work, not a new Message or execution. An inaccessible or unknown ID instead returns the [task-not-found error](#5-error-codes).
+
+**Cancel running work.** In a separate run, `task-124` is still working:
+
+```json
+{"jsonrpc":"2.0","id":"cancel-1","method":"CancelTask","params":{"id":"task-124"}}
+```
+
+```json
+{"jsonrpc":"2.0","id":"cancel-1","result":{"id":"task-124","contextId":"ctx-sales-001","status":{"state":"TASK_STATE_CANCELED"}}}
+```
+
+That response confirms cancellation. If the agent finishes before it handles the same request, this alternative response is possible instead:
+
+```json
+{"jsonrpc":"2.0","id":"cancel-1","error":{"code":-32002,"message":"Task is not in a cancelable state"}}
+```
+
+The error does not tell the client which terminal outcome won. Read the same Task to reconcile:
+
+```json
+{"jsonrpc":"2.0","id":"read-after-cancel","method":"GetTask","params":{"id":"task-124","historyLength":0}}
+```
+
+```json
+{"jsonrpc":"2.0","id":"read-after-cancel","result":{"id":"task-124","contextId":"ctx-sales-001","status":{"state":"TASK_STATE_COMPLETED"},"artifacts":[{"artifactId":"art-124","parts":[{"text":"Report finished before cancellation."}]}]}}
+```
+
+This branch ends in `COMPLETED`; claiming cancellation just because the request was sent would hide a finished result. The same reconciliation applies when a [subscription loses a completion race](04_streaming_and_push.md#completion-can-happen-between-the-two-requests).
+
+**List two working Tasks, one per page.** These are another illustrative run: the server has `task-201` and `task-202` matching the caller's context/state filters. The first request has no cursor:
+
+```json
+{"jsonrpc":"2.0","id":"list-1","method":"ListTasks","params":{"contextId":"ctx-sales-001","status":"TASK_STATE_WORKING","pageSize":1,"historyLength":0,"includeArtifacts":false}}
+```
+
+```json
+{
+  "jsonrpc":"2.0", "id":"list-1",
+  "result":{
+    "tasks":[{"id":"task-201","contextId":"ctx-sales-001","status":{"state":"TASK_STATE_WORKING"}}],
+    "nextPageToken":"opaque-sales-page-2", "pageSize":1, "totalSize":2
+  }
+}
+```
+
+Copy the returned token unchanged, preserving the query and caller identity:
+
+```json
+{"jsonrpc":"2.0","id":"list-2","method":"ListTasks","params":{"contextId":"ctx-sales-001","status":"TASK_STATE_WORKING","pageSize":1,"historyLength":0,"includeArtifacts":false,"pageToken":"opaque-sales-page-2"}}
+```
+
+```json
+{
+  "jsonrpc":"2.0", "id":"list-2",
+  "result":{
+    "tasks":[{"id":"task-202","contextId":"ctx-sales-001","status":{"state":"TASK_STATE_WORKING"}}],
+    "nextPageToken":"", "pageSize":1, "totalSize":2
+  }
+}
+```
+
+`tasks` is this page, `pageSize` is the page size used, and `totalSize` is the matching total before pagination. Stop when `nextPageToken` is empty; a short page alone is not the stop signal. The token is opaque server state, not an offset to edit or a reusable authorization grant. This example assumes the two matching Tasks remain working during both reads; it does not establish snapshot isolation while Tasks change. `historyLength: 0` and `includeArtifacts: false` make the list compact; use `GetTask` when the UI needs a selected Task's persisted outputs.
+
+The operation return types and cursor fields come from the [specification 1.0.1 protobuf contract](https://github.com/a2aproject/A2A/blob/v1.0.1/specification/a2a.proto) and [JSON-RPC method mapping](https://a2a-protocol.org/v1.0.0/specification/#94-core-methods), checked 2026-11-16.
+
+### The same Message over HTTP+JSON and gRPC
+
+Compare the earlier `req-math-001` JSON-RPC exchange with this HTTP+JSON alternative. Assume the selected HTTP+JSON interface is `https://math.example.com`; use that interface's base path in a real deployment.
+
+```http
+POST /message:send HTTP/1.1
+Host: math.example.com
+Content-Type: application/a2a+json
+A2A-Version: 1.0
+Authorization: Bearer <a2a-client-token>
+
+{"message":{"messageId":"msg-math-001","role":"ROLE_USER","parts":[{"text":"What is 2 + 2?"}]}}
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/a2a+json
+
+{"message":{"messageId":"msg-math-002","contextId":"ctx-math-001","role":"ROLE_AGENT","parts":[{"text":"2 + 2 = 4"}]}}
+```
+
+The HTTP+JSON request body is the JSON-RPC request's `params`; its success body is the JSON-RPC response's `result`. There is no JSON-RPC `id`, `method` or `params` wrapper on this binding. `messageId`, role, content and response choice retain their meaning.
+
+For gRPC, the corresponding method is `lf.a2a.v1.A2AService/SendMessage`. This is an explanatory Python client excerpt using SDK 1.1.2's generated stub: `channel` is an already established TLS channel to the selected gRPC interface, and `access_token` is the runtime caller credential.
+
+```python
+from google.protobuf.json_format import MessageToDict
+from a2a.types import Message, Part, Role, SendMessageRequest, a2a_pb2_grpc
+
+request = SendMessageRequest(message=Message(
+    message_id="msg-math-001", role=Role.ROLE_USER,
+    parts=[Part(text="What is 2 + 2?")],
+))
+reply = await a2a_pb2_grpc.A2AServiceStub(channel).SendMessage(
+    request,
+    metadata=(("a2a-version", "1.0"),
+              ("authorization", f"Bearer {access_token}")),
+    timeout=30,
+)
+print(MessageToDict(reply))
+```
+
+A representative decoded reply, displayed as ProtoJSON for comparison, is:
+
+```json
+{"message":{"messageId":"msg-math-002","contextId":"ctx-math-001","role":"ROLE_AGENT","parts":[{"text":"2 + 2 = 4"}]}}
+```
+
+The actual gRPC body is binary protobuf over HTTP/2; the JSON above is its decoded view. The version is gRPC metadata `a2a-version`, not a field added to `Message`. A native stub returns `SendMessageResponse`; `GetTask` instead returns a native `Task`, matching the JSON-RPC distinction above. See the [pinned gRPC client implementation](https://github.com/a2aproject/a2a-python/blob/v1.1.2/src/a2a/client/transports/grpc.py) and [binding's service-parameter rules](https://a2a-protocol.org/v1.0.0/specification/#102-service-parameter-transmission), checked 2026-11-16.
+
+---
+
 ## 4. The HTTP layer
 
 For the JSON-RPC binding, every method call is a single HTTP request:
@@ -335,7 +476,7 @@ Clients branch first on the binding's native error code or type. Only inspect `r
 
 - The Agent Card advertises an interface; the selected binding maps the same abstract A2A operation to its own wire envelope.
 - A successful HTTP exchange can still contain a JSON-RPC `error`; inspect both layers before using the result.
-- A JSON-RPC response has one `result` or one `error`. The returned `result` itself has one A2A result variant.
+- A JSON-RPC response has one `result` or one `error`. `SendMessage` wraps one `task` or `message`; Get/Cancel return a Task directly, and List returns a page object.
 - The client must retain the chosen interface and version across later Task operations.
 
 **Q: The Recipe Agent returns HTTP 200 with JSON-RPC `error.code = -32001`. Did the HTTP exchange fail?**

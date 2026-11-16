@@ -146,7 +146,7 @@ sequenceDiagram
   A-->>C: Task COMPLETED with persisted report
 ```
 
-An already-terminal Task rejects `SubscribeToTask`. Recover its persisted state with `GetTask`; repeating the subscription or resending the report Message is not the recovery. A preliminary `GetTask` cannot remove the race because completion can happen just after that read. If a subscription error is due to missing capability, authorization or an unknown Task, handle that actual cause; do not classify every error as successful completion. These are the [normative subscription semantics](https://a2a-protocol.org/latest/specification/#316-subscribe-to-task).
+An already-terminal Task rejects `SubscribeToTask`. Recover its persisted state with `GetTask` ([complete read/cancel/list request and reply bodies](02_transport_and_rpc.md#read-cancel-and-list-existing-tasks)); repeating the subscription or resending the report Message is not the recovery. A preliminary `GetTask` cannot remove the race because completion can happen just after that read. If a subscription error is due to missing capability, authorization or an unknown Task, handle that actual cause; do not classify every error as successful completion. These are the [normative subscription semantics](https://a2a-protocol.org/latest/specification/#316-subscribe-to-task).
 
 ### Reconnect without restarting the Task
 
@@ -251,6 +251,44 @@ Content-Type: application/a2a+json
 The receiver validates the header and expected `taskId`, persists the update idempotently, and returns `204 No Content`. A `401`/`403` at the callback means authentication failed; connection/DNS errors mean the endpoint is not publicly reachable; `PushNotificationNotSupportedError` means the card capability was absent; `TaskNotFoundError` means the config was attached to an inaccessible or unknown Task.
 
 The POST body is exactly one `StreamResponse` — `task`, `message`, `statusUpdate`, or `artifactUpdate`. It does not echo the config's legacy `token` field. Configs can also be retrieved, listed, and deleted, and all operations are gated by `capabilities.pushNotifications`.
+
+### Inspect and remove the registered callback
+
+After creation, manage `push-42` on `t-9f3` without resending the original user Message. These are complete illustrative JSON-RPC bodies for the agent's advertised JSON-RPC URL; send `A2A-Version: 1.0`, `Content-Type: application/json` and the owning caller's authentication on every call. The callback URL is application data; its bearer credential is omitted from these response examples under the server's secret-redaction policy.
+
+**Get the config:**
+
+```json
+{"jsonrpc":"2.0","id":"push-get-1","method":"GetTaskPushNotificationConfig","params":{"taskId":"t-9f3","id":"push-42"}}
+```
+
+```json
+{"jsonrpc":"2.0","id":"push-get-1","result":{"id":"push-42","taskId":"t-9f3","url":"https://client.example.com/a2a/webhook","authentication":{"scheme":"Bearer"}}}
+```
+
+**List this Task's configs:**
+
+```json
+{"jsonrpc":"2.0","id":"push-list-1","method":"ListTaskPushNotificationConfigs","params":{"taskId":"t-9f3","pageSize":10}}
+```
+
+```json
+{"jsonrpc":"2.0","id":"push-list-1","result":{"configs":[{"id":"push-42","taskId":"t-9f3","url":"https://client.example.com/a2a/webhook","authentication":{"scheme":"Bearer"}}],"nextPageToken":""}}
+```
+
+This Task has one config and no next page. If `nextPageToken` is nonempty, send it as `pageToken` with the same Task and caller to continue listing. The config ID is `push-42`; `taskId` identifies its parent work, while the JSON-RPC `id` correlates only the call.
+
+**Delete that config:**
+
+```json
+{"jsonrpc":"2.0","id":"push-delete-1","method":"DeleteTaskPushNotificationConfig","params":{"taskId":"t-9f3","id":"push-42"}}
+```
+
+```json
+{"jsonrpc":"2.0","id":"push-delete-1","result":{}}
+```
+
+Deletion returns an empty success object, not a Task and not a cancellation. The Task can continue; use GetTask or an existing stream to observe it. Removing a config does not recall a webhook POST already in flight, so the receiver must still authenticate and deduplicate late deliveries. The shapes follow the [1.0.1 push-config RPC definitions](https://github.com/a2aproject/A2A/blob/v1.0.1/specification/a2a.proto), checked 2026-11-16.
 
 SSE is connection-shaped: the client holds the channel. Push is event-shaped: the agent initiates a new authenticated HTTP request for each update.
 

@@ -526,6 +526,8 @@ It is fetched via the `GetExtendedAgentCard` operation. The catch:
 
 The flow: fetch the public card → see `capabilities.extendedAgentCard` → authenticate → call `GetExtendedAgentCard` → receive the richer card → use *its* skills and security requirements going forward.
 
+See the [authenticated card request and complete reply](../02_protocol/01_agent_card.md#read-the-authenticated-card-on-the-wire): the bearer credential is in the HTTP header, `params` is `{}` for an interface without tenant routing, and `result` is the returned AgentCard itself. Fetching this card creates no Task and grants no resource access by itself. A missing/invalid credential can produce the ingress HTTP `401` described in §4; it is not a `TASK_STATE_AUTH_REQUIRED` response.
+
 ✅ Use this to hide privileged or internal-only skills (e.g. `admin:reconcile-ledger`) from the public internet while still publishing a discoverable base card.
 
 ---

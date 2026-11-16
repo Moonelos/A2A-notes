@@ -227,6 +227,68 @@ Public card (well-known)          Extended card (authenticated)
 
 The extended card lets you keep the public surface minimal (good for security and signal-to-noise) while still serving internal consumers a complete picture.
 
+### Read the authenticated card on the wire
+
+Suppose the public invoice card advertises only `reconcile`. These are **excerpts of its fields**, not a complete public card; its public security declaration tells the client which credential to obtain before requesting more:
+
+```json
+{
+  "capabilities": {"extendedAgentCard": true},
+  "securitySchemes": {
+    "corp-bearer": {"httpAuthSecurityScheme": {"scheme": "Bearer"}}
+  },
+  "securityRequirements": [{"schemes": {"corp-bearer": {"list": []}}}],
+  "skills": [{"id": "reconcile", "name": "Reconcile", "description": "Reconcile invoices", "tags": ["finance"]}]
+}
+```
+
+The following **illustrative JSON-RPC exchange** uses the service URL selected from that public card. The bearer value is a placeholder for an out-of-band credential, never card content. This interface has no `tenant` routing value, so the operation needs no parameters beyond an empty object.
+
+```http
+POST /a2a HTTP/1.1
+Host: invoices.example.com
+Authorization: Bearer <access-token>
+A2A-Version: 1.0
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":"card-1","method":"GetExtendedAgentCard","params":{}}
+```
+
+A successful response contains a **complete AgentCard directly in `result`**:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0",
+  "id": "card-1",
+  "result": {
+    "name": "Invoice Agent",
+    "description": "Reconcile invoices and export authorized account reports",
+    "version": "1.0.0",
+    "supportedInterfaces": [
+      {"url": "https://invoices.example.com/a2a", "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}
+    ],
+    "capabilities": {"extendedAgentCard": true},
+    "defaultInputModes": ["text/plain"],
+    "defaultOutputModes": ["text/plain"],
+    "securitySchemes": {
+      "corp-bearer": {"httpAuthSecurityScheme": {"scheme": "Bearer"}}
+    },
+    "securityRequirements": [{"schemes": {"corp-bearer": {"list": []}}}],
+    "skills": [
+      {"id": "reconcile", "name": "Reconcile", "description": "Reconcile invoices", "tags": ["finance"]},
+      {"id": "bulk-export", "name": "Bulk export", "description": "Export reports for accounts this caller may access", "tags": ["finance", "export"]}
+    ]
+  }
+}
+```
+
+`card-1` correlates this RPC only; discovery creates no Message, Task, or conversation context. The added `bulk-export` skill becomes visible to this authenticated session. Its presence does not grant access to every account: the service still checks the verified caller's resource permissions when work is requested. Do not merge just the new skill into the old card or cache this private response for unrelated callers; use the returned card as the authoritative document for this authenticated session. If the credential is absent or invalid, the deployment can reject at ingress with HTTP `401` and `WWW-Authenticate: Bearer` before this RPC executes. The [production auth flow](../05_production/01_authentication.md#4-the-server-flow-validate-before-you-process) distinguishes that rejection from an A2A Task needing downstream authorization.
+
+The response shape and optional request `tenant` follow the [pinned 1.0.1 schema](https://github.com/a2aproject/A2A/blob/v1.0.1/specification/a2a.proto); the [extended-card operation](https://github.com/a2aproject/A2A/blob/v1.0.1/docs/specification.md#3111-get-extended-agent-card) requires a complete card.
+
 ---
 
 ## 7. Signed Cards (JWS)
