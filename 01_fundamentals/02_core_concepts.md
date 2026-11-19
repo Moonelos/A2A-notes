@@ -337,11 +337,11 @@ Watch the decision between receipt and the response; that step is your server lo
 sequenceDiagram
   participant C as Report client
   participant S as Report server
-  C->>S: Message metadata requestTag=ui-17; separate RPC metadata
+  C->>S: Message metadata requestTag=ui-17, separate RPC metadata
   S->>S: Validate optional requestTag
   S->>S: Explicitly select requestTag for Task result metadata
   S-->>C: Task metadata requestTag plus server generator
-  S-->>C: Artifact metadata format; independent progress event metadata
+  S-->>C: Artifact metadata format and independent progress event metadata
 ```
 
 The SDK serializes the maps and offers helper APIs. There is **no general A2A rule or SDK guarantee** that copies, merges or echoes `params.metadata` into `message.metadata`, `task.metadata`, Artifact metadata, every future event, or the next turn. If the server keeps the original client Message in Task history, its original `message.metadata` may be visible there; that is still the Message's annotation, not a copy into `Task.metadata`.
